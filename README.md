@@ -25,7 +25,7 @@ Supports dense models (LLaMA, Qwen, Mistral), **Mixture-of-Experts** (Qwen-MoE, 
 | **Nemotron-3-Nano-4B** | **TurboQuant** | **3** | **—** | **~2.2 GB** | **75.6 tok/s** |
 | Nemotron-3-Super-120B-A12B | BF16 (original) | 16 | — | ~240 GB | *Doesn't fit 64GB* |
 | **Nemotron-3-Super-120B-A12B** | **TurboQuant** | **3** | **—** | **~50 GB** | **18.7 tok/s** |
-| **Nemotron-3-Super-120B-A12B (hybrid for 48GB)** | **TQ 3-attn / 2-experts, gs=32** | **2/3 mix** | **—** | **~36 GB** | **~22.5 tok/s** |
+| **[Nemotron-3-Super-120B-A12B (hybrid for 48GB)](https://huggingface.co/manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32)** | **TQ 3-attn / 2-experts, gs=32** | **2/3 mix** | **—** | **~36 GB** | **~22.5 tok/s** |
 
 ## Key Results — KV Cache Compression
 
@@ -521,7 +521,20 @@ Mac after raising `iogpu.wired_limit_mb`. For users on a 64 GB Mac who want
 headroom for other applications — or for users on **48 GB Macs** — there is
 a **hybrid quantization** that keeps attention at 3-bit (where precision
 matters most) and pushes experts to 2-bit (where the bulk of the weights
-live), at a smaller group size (g=32) that improves per-group fit:
+live), at a smaller group size (g=32) that improves per-group fit.
+
+**Pre-converted model on Hugging Face:**
+
+```bash
+hf download manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32 \
+    --local-dir ~/models/nemotron-3-super-120b-tq3a-tq2e-g32
+```
+
+→ [`manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32`](https://huggingface.co/manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32)
+on the Hub: ~36 GB on disk, ~40 GB peak memory, fits a default 48 GB
+`iogpu.wired_limit_mb` cap.
+
+**Or convert from BF16 source yourself:**
 
 ```bash
 python -m turboquant_mlx.convert \
