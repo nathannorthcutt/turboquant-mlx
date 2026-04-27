@@ -196,12 +196,13 @@ def turboquant_quantize(
                     needs_rotation = False
 
             seed = _get_layer_seed(tq_config.rotation_seed, path)
-            print(f"[INFO] Quantizing SwitchLinear {path} ({num_experts} experts, {input_dims}d)")
+            layer_bits = tq_config.bits_for_path(path)
+            print(f"[INFO] Quantizing SwitchLinear {path} ({num_experts} experts, {input_dims}d, {layer_bits}b)")
 
             bias_tensor = module.bias if has_bias else None
             pq_switch = PolarQuantizedSwitchLinear.from_switch_linear(
                 None,
-                bits=tq_config.bits,
+                bits=layer_bits,
                 group_size=tq_config.group_size,
                 seed=seed,
                 needs_rotation=needs_rotation,
@@ -274,9 +275,10 @@ def turboquant_quantize(
 
         # Quantize the linear layer
         seed = _get_layer_seed(tq_config.rotation_seed, path)
+        layer_bits = tq_config.bits_for_path(path)
         pq_layer = PolarQuantizedLinear.from_linear(
             module,
-            bits=tq_config.bits,
+            bits=layer_bits,
             group_size=tq_config.group_size,
             seed=seed,
             needs_rotation=needs_rotation,

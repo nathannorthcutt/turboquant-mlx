@@ -29,6 +29,8 @@ def convert(
     fuse_rotations: bool = True,
     use_qjl: bool = False,
     dtype: str = None,
+    attn_bits: int = None,
+    mlp_bits: int = None,
 ):
     """Convert a HuggingFace model to TurboQuant-compressed MLX format.
 
@@ -59,6 +61,8 @@ def convert(
         rotation_seed=rotation_seed,
         fuse_rotations=fuse_rotations,
         use_qjl=use_qjl,
+        attn_bits=attn_bits,
+        mlp_bits=mlp_bits,
     )
 
     # Load model
@@ -79,7 +83,12 @@ def convert(
 
     # Quantize
     arch = config.get("model_type", "unknown")
-    print(f"[INFO] Quantizing with TurboQuant ({bits}-bit, gs={group_size}, rotation={rotation})")
+    if tq_config.is_hybrid:
+        eff_attn = tq_config.attn_bits if tq_config.attn_bits is not None else tq_config.bits
+        eff_mlp = tq_config.mlp_bits if tq_config.mlp_bits is not None else tq_config.bits
+        print(f"[INFO] Quantizing with TurboQuant (hybrid: attn={eff_attn}b mlp={eff_mlp}b default={bits}b, gs={group_size}, rotation={rotation})")
+    else:
+        print(f"[INFO] Quantizing with TurboQuant ({bits}-bit, gs={group_size}, rotation={rotation})")
     print(f"[INFO] Architecture: {arch}")
     print(f"[INFO] Effective bits/weight: {tq_config.effective_bits:.2f}")
 
@@ -155,6 +164,18 @@ def configure_parser() -> argparse.ArgumentParser:
         choices=["float16", "bfloat16", "float32"],
         help="Model dtype before quantization",
     )
+    parser.add_argument(
+        "--attn-bits",
+        type=int, default=None, choices=[2, 3, 4],
+        help="Override bits for attention-block linears (q/k/v/o_proj). "
+             "Defaults to --bits when omitted.",
+    )
+    parser.add_argument(
+        "--mlp-bits",
+        type=int, default=None, choices=[2, 3, 4],
+        help="Override bits for MLP and MoE expert linears. "
+             "Defaults to --bits when omitted.",
+    )
     return parser
 
 
@@ -171,6 +192,8 @@ def main():
         fuse_rotations=args.fuse_rotations,
         use_qjl=args.use_qjl,
         dtype=args.dtype,
+        attn_bits=args.attn_bits,
+        mlp_bits=args.mlp_bits,
     )
 
 

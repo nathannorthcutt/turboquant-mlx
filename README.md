@@ -25,6 +25,7 @@ Supports dense models (LLaMA, Qwen, Mistral), **Mixture-of-Experts** (Qwen-MoE, 
 | **Nemotron-3-Nano-4B** | **TurboQuant** | **3** | **—** | **~2.2 GB** | **75.6 tok/s** |
 | Nemotron-3-Super-120B-A12B | BF16 (original) | 16 | — | ~240 GB | *Doesn't fit 64GB* |
 | **Nemotron-3-Super-120B-A12B** | **TurboQuant** | **3** | **—** | **~50 GB** | **18.7 tok/s** |
+| **Nemotron-3-Super-120B-A12B (hybrid for 48GB)** | **TQ 3-attn / 2-experts, gs=32** | **2/3 mix** | **—** | **~36 GB** | **~22.5 tok/s** |
 
 ## Key Results — KV Cache Compression
 
@@ -511,6 +512,51 @@ python -m turboquant_mlx.generate \
 |-------|------|------|----------|-----------|---------|
 | **Nemotron-3-Nano-4B** | **3** | **~2.2 GB** | **4.3 GB** | **75.6 tok/s** | **Coherent** |
 | **Nemotron-3-Super-120B-A12B** | **3** | **~50 GB** | **54.7 GB** | **18.7 tok/s** | **Coherent with structured `<think>` reasoning (974-token answer w/ self-correction, formulas, formatted structure)** |
+| **Nemotron-3-Super-120B-A12B (hybrid)** | **3-attn / 2-experts, gs=32** | **~36 GB** | **~40 GB** | **~22.5 tok/s** | **Coherent prose, code, format, and long-context recall; math accuracy degraded — see Phase-1 note below** |
+
+#### 48 GB-RAM target: hybrid (3-bit attention / 2-bit experts) at group-size 32
+
+The standard 3-bit Super-120B (~50 GB) needs ~55 GB peak and only fits a 64 GB
+Mac after raising `iogpu.wired_limit_mb`. For users on a 64 GB Mac who want
+headroom for other applications — or for users on **48 GB Macs** — there is
+a **hybrid quantization** that keeps attention at 3-bit (where precision
+matters most) and pushes experts to 2-bit (where the bulk of the weights
+live), at a smaller group size (g=32) that improves per-group fit:
+
+```bash
+python -m turboquant_mlx.convert \
+    --hf-path nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
+    --mlx-path ./nemotron-3-super-120b-tq3a-tq2e-g32 \
+    --bits 2 --attn-bits 3 --mlp-bits 2 --group-size 32
+```
+
+For long-form generation, the model needs a small repetition penalty to
+avoid degenerate tail loops at >1500 tokens. The recommended decode config
+(empirically validated to keep essay, code, format, and long-context
+recall clean):
+
+```bash
+python -m turboquant_mlx.generate \
+    --model ./nemotron-3-super-120b-tq3a-tq2e-g32 \
+    --prompt "Why is the sky blue?" \
+    --max-tokens 4096 --min-tokens 50 \
+    --temp 0.7 --rep-penalty 1.04 --rep-ctx 256
+```
+
+> **Phase-1 known limitation: math accuracy.** Step-by-step arithmetic
+> on the hybrid degrades under any non-zero `--rep-penalty`. For
+> numeric/math prompts in Phase 1, **omit `--rep-penalty`** (you may
+> see long-gen tail loops on long prompts, but the arithmetic will land
+> correctly more often). A permanent fix is planned for Phase 2 — likely
+> first/last-layer bit protection, a calibration-data codebook, or a
+> fused QJL Metal kernel. Until Phase 2, use the hybrid for prose,
+> coding, format, and long-context tasks; use the standard 3-bit model
+> for serious numeric work.
+
+The fused MoE decode kernel transparently chunks expert routings on long
+prompts, so this hybrid handles long-context retrieval (e.g. password-
+recall over 4000+ tokens of context) without the kernel argument-validation
+crash that affected earlier builds.
 
 ---
 

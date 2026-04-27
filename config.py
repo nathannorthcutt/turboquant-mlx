@@ -19,6 +19,11 @@ class TurboQuantConfig:
             Hadamard rotation into a diagonal norm weight is not mathematically
             valid (H(diag(w) @ x) != diag(H@w) @ x). Online rotation is used
             instead, with negligible overhead (~0.3% FLOPs).
+        attn_bits: Optional override for attention-block linears (q/k/v/o_proj).
+            None falls back to ``bits``. Useful for hybrid configs that keep
+            attention sharper than MLP/expert weights.
+        mlp_bits: Optional override for MLP / MoE expert linears
+            (gate/up/down_proj, experts.*). None falls back to ``bits``.
     """
 
     bits: int = 3
@@ -27,14 +32,40 @@ class TurboQuantConfig:
     rotation: str = "hadamard"
     rotation_seed: int = 42
     fuse_rotations: bool = False
+    attn_bits: Optional[int] = None
+    mlp_bits: Optional[int] = None
 
     def __post_init__(self):
         if self.bits not in (2, 3, 4):
             raise ValueError(f"bits must be 2, 3, or 4, got {self.bits}")
+        if self.attn_bits is not None and self.attn_bits not in (2, 3, 4):
+            raise ValueError(f"attn_bits must be 2, 3, or 4, got {self.attn_bits}")
+        if self.mlp_bits is not None and self.mlp_bits not in (2, 3, 4):
+            raise ValueError(f"mlp_bits must be 2, 3, or 4, got {self.mlp_bits}")
         if self.group_size not in (32, 64, 128):
             raise ValueError(f"group_size must be 32, 64, or 128, got {self.group_size}")
         if self.rotation not in ("hadamard", "blockwise_hadamard", "none"):
             raise ValueError(f"rotation must be 'hadamard', 'blockwise_hadamard', or 'none', got {self.rotation}")
+
+    def bits_for_path(self, path: str) -> int:
+        """Resolve the bit-width for a layer based on its dotted path.
+
+        Attention-block linears use ``attn_bits`` when set; MLP / MoE expert
+        linears use ``mlp_bits`` when set; everything else (and either
+        override left as None) falls back to ``bits``.
+        """
+        for p in path.split("."):
+            if p in ("self_attn", "attention", "linear_attn"):
+                return self.attn_bits if self.attn_bits is not None else self.bits
+            if p in ("mlp", "feed_forward"):
+                return self.mlp_bits if self.mlp_bits is not None else self.bits
+        return self.bits
+
+    @property
+    def is_hybrid(self) -> bool:
+        eff_attn = self.attn_bits if self.attn_bits is not None else self.bits
+        eff_mlp = self.mlp_bits if self.mlp_bits is not None else self.bits
+        return eff_attn != eff_mlp
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +76,8 @@ class TurboQuantConfig:
             "rotation": self.rotation,
             "rotation_seed": self.rotation_seed,
             "fuse_rotations": self.fuse_rotations,
+            "attn_bits": self.attn_bits,
+            "mlp_bits": self.mlp_bits,
         }
 
     @classmethod
@@ -56,6 +89,8 @@ class TurboQuantConfig:
             rotation=d.get("rotation", "hadamard"),
             rotation_seed=d.get("rotation_seed", 42),
             fuse_rotations=d.get("fuse_rotations", False),
+            attn_bits=d.get("attn_bits", None),
+            mlp_bits=d.get("mlp_bits", None),
         )
 
     @property

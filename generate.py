@@ -68,6 +68,8 @@ def _prepare_polar_layers(model, weights, tq_config):
         has_bias = f"{path}.bias" in weights
         has_qjl = f"{path}.qjl_packed" in weights
 
+        layer_bits = tq_config.bits_for_path(path)
+
         if has_switch and isinstance(module, SwitchLinear):
             num_experts, output_dims, input_dims = module.weight.shape
             pq = PolarQuantizedSwitchLinear(
@@ -75,7 +77,7 @@ def _prepare_polar_layers(model, weights, tq_config):
                 output_dims=output_dims,
                 num_experts=num_experts,
                 bias=has_bias,
-                bits=tq_config.bits,
+                bits=layer_bits,
                 group_size=tq_config.group_size,
             )
             updates[path] = pq
@@ -85,7 +87,7 @@ def _prepare_polar_layers(model, weights, tq_config):
                 input_dims=input_dims,
                 output_dims=output_dims,
                 bias=has_bias,
-                bits=tq_config.bits,
+                bits=layer_bits,
                 group_size=tq_config.group_size,
                 use_qjl=has_qjl,
             )
@@ -204,6 +206,17 @@ def main():
         help="Sampling temperature (default: 0.7)",
     )
     parser.add_argument(
+        "--rep-penalty", type=float, default=None,
+        help="Repetition penalty (e.g. 1.04). Disabled when omitted. "
+             "Recommended for hybrid Nemotron-3 to avoid long-gen tail "
+             "loops; omit for numeric/math prompts.",
+    )
+    parser.add_argument(
+        "--rep-ctx", type=int, default=256,
+        help="Repetition penalty context window in tokens (default: 256). "
+             "Only used when --rep-penalty is set.",
+    )
+    parser.add_argument(
         "--fast", action="store_true",
         help="Fast mode: skip QJL correction for ~25%% faster decode (slightly lower quality)",
     )
@@ -233,7 +246,7 @@ def main():
 
     # Use mlx_lm's generate function with a sampler for temperature
     from mlx_lm import generate
-    from mlx_lm.sample_utils import make_sampler
+    from mlx_lm.sample_utils import make_sampler, make_logits_processors
     from turboquant_mlx.sampling import (
         eos_token_ids,
         make_min_tokens_logits_processor,
@@ -243,7 +256,16 @@ def main():
     min_tokens_proc = make_min_tokens_logits_processor(
         args.min_tokens, eos_token_ids(tokenizer)
     )
-    logits_processors = [min_tokens_proc] if min_tokens_proc is not None else None
+    logits_processors = []
+    if args.rep_penalty is not None:
+        logits_processors.extend(make_logits_processors(
+            repetition_penalty=args.rep_penalty,
+            repetition_context_size=args.rep_ctx,
+        ))
+    if min_tokens_proc is not None:
+        logits_processors.append(min_tokens_proc)
+    if not logits_processors:
+        logits_processors = None
 
     print(f"\nPrompt: {args.prompt}\n")
     response = generate(

@@ -112,7 +112,15 @@ class PolarQuantizedSwitchLinear(nn.Module):
             x = rotate_input(x, self.signs)
 
         # Decode path: fused Metal kernel (no weight materialization)
-        # Only reads the k selected experts, not all num_experts
+        # Only reads the k selected experts, not all num_experts.
+        # NOTE: when mlx-lm's SwitchMLP triggers do_sort, x.ndim drops to 3
+        # and indices.ndim drops to 1, so n_tokens and k both equal
+        # n_real_tokens * k_real and the n_tokens==k branch fires. That is
+        # the correct behavior — multi_gather_qmv handles N (token,expert)
+        # routings without materializing all experts. We DO NOT fall back to
+        # _dequantize_all here because this model has 512 experts (top-22)
+        # and full dequant of one layer is ~10 GB → instant OOM.  See
+        # issue #1; the kernel itself chunks for very large N.
         n_tokens = 1 if x.ndim <= 2 else math.prod(x.shape[:-2])
         k = indices.shape[-1] if indices.ndim >= 1 else 1
 

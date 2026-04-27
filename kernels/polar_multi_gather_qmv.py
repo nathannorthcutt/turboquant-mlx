@@ -129,19 +129,42 @@ def polar_multi_gather_qmv(
         (k, output_dims) — output for each selected expert.
     """
     indices = indices.astype(mx.uint32)
-    k = indices.shape[0]
-    output_dims = packed_weight.shape[1]
+    k = int(indices.shape[0])
+    output_dims = int(packed_weight.shape[1])
 
     kernel = _get_kernel(bits, group_size)
 
-    total_work = k * output_dims
-    outputs = kernel(
-        inputs=[packed_weight, scales, codebook, x, indices],
-        template=[("T", x.dtype)],
-        grid=(total_work * THREADS_PER_ROW, 1, 1),
-        threadgroup=(THREADS_PER_ROW, 1, 1),
-        output_shapes=[(k, output_dims)],
-        output_dtypes=[x.dtype],
-    )
+    # Cap k per kernel call. Empirically the kernel succeeds on small N
+    # (e.g. 11k token×expert routings) but fails inside mlx for very large
+    # multi-chunk prefills (issue #1). Splitting the call along k keeps
+    # grid sizes modest and is safe — the kernel computes each row
+    # independently. K_CHUNK is a conservative cap that keeps grid_x well
+    # under any plausible Metal limit.
+    K_CHUNK = 4096
+    if k <= K_CHUNK:
+        outputs = kernel(
+            inputs=[packed_weight, scales, codebook, x, indices],
+            template=[("T", x.dtype)],
+            grid=(k * output_dims * THREADS_PER_ROW, 1, 1),
+            threadgroup=(THREADS_PER_ROW, 1, 1),
+            output_shapes=[(k, output_dims)],
+            output_dtypes=[x.dtype],
+        )
+        return outputs[0]
 
-    return outputs[0]
+    chunks = []
+    for start in range(0, k, K_CHUNK):
+        end = min(start + K_CHUNK, k)
+        n = end - start
+        x_chunk = x[start:end]
+        idx_chunk = indices[start:end]
+        out_chunk = kernel(
+            inputs=[packed_weight, scales, codebook, x_chunk, idx_chunk],
+            template=[("T", x.dtype)],
+            grid=(n * output_dims * THREADS_PER_ROW, 1, 1),
+            threadgroup=(THREADS_PER_ROW, 1, 1),
+            output_shapes=[(n, output_dims)],
+            output_dtypes=[x.dtype],
+        )[0]
+        chunks.append(out_chunk)
+    return mx.concatenate(chunks, axis=0)
