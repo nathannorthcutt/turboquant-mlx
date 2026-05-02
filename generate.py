@@ -226,7 +226,38 @@ def main():
              "Useful for thinking-mode models (Nemotron 3, etc.) whose chat "
              "template primes EOS as the top-1 logit (default: 0)",
     )
+    # ── TurboQuant KV-cache flags (v0.2) ──────────────────────────────
+    parser.add_argument(
+        "--kv-bits", type=int, default=None,
+        help="Symmetric KV-cache bits (K=V). Use --kv-k-bits / --kv-v-bits "
+             "for mixed precision instead. Omit to keep fp16 cache.",
+    )
+    parser.add_argument(
+        "--kv-k-bits", type=int, default=None,
+        help="Bits for K cache (recommended: 8). Pair with --kv-v-bits.",
+    )
+    parser.add_argument(
+        "--kv-v-bits", type=int, default=None,
+        help="Bits for V cache (recommended: 3). Pair with --kv-k-bits. "
+             "Mixed K8/V3 is the v0.2 recommended default.",
+    )
+    parser.add_argument(
+        "--kv-min-tokens", type=int, default=0,
+        help="Keep the first N cached tokens in fp16 (attention-sink "
+             "protection). 128 is a reasonable default for long-context "
+             "generation. Default: 0 (quantize from token 0).",
+    )
+    parser.add_argument(
+        "--kv-group-size", type=int, default=64,
+        help="Hadamard rotation group size for KV quantization (default: 64).",
+    )
     args = parser.parse_args()
+
+    # Validate KV cache flags
+    if args.kv_bits is not None and (args.kv_k_bits is not None or args.kv_v_bits is not None):
+        parser.error("--kv-bits is mutually exclusive with --kv-k-bits/--kv-v-bits")
+    if (args.kv_k_bits is None) != (args.kv_v_bits is None):
+        parser.error("--kv-k-bits and --kv-v-bits must be set together")
 
     mode = "fast (QJL disabled)" if args.fast else "accurate (QJL enabled)"
     print(f"[INFO] Loading TurboQuant model from {args.model} [{mode}]")
@@ -267,6 +298,32 @@ def main():
     if not logits_processors:
         logits_processors = None
 
+    # Build prompt cache. Always start from make_prompt_cache so hybrid
+    # models (Nemotron-H, Qwen3.5) get the right per-layer cache type;
+    # then convert only the standard KVCache entries to TurboQuant.
+    from mlx_lm.models.cache import make_prompt_cache
+    prompt_cache = make_prompt_cache(model)
+
+    if args.kv_bits is not None or args.kv_k_bits is not None:
+        from turboquant_mlx.layers.polar_kv_cache import (
+            convert_cache_to_turboquant,
+        )
+        prompt_cache = convert_cache_to_turboquant(
+            prompt_cache,
+            tq_bits=args.kv_bits,
+            k_bits=args.kv_k_bits,
+            v_bits=args.kv_v_bits,
+            group_size=args.kv_group_size,
+            min_tokens_before_quant=args.kv_min_tokens,
+        )
+        if args.kv_bits is not None:
+            print(f"[INFO] TurboQuant KV cache: K=V={args.kv_bits}-bit, "
+                  f"group={args.kv_group_size}, sink={args.kv_min_tokens}")
+        else:
+            print(f"[INFO] TurboQuant KV cache: K={args.kv_k_bits}-bit, "
+                  f"V={args.kv_v_bits}-bit, group={args.kv_group_size}, "
+                  f"sink={args.kv_min_tokens}")
+
     print(f"\nPrompt: {args.prompt}\n")
     response = generate(
         model, tokenizer,
@@ -274,6 +331,7 @@ def main():
         max_tokens=args.max_tokens,
         sampler=sampler,
         logits_processors=logits_processors,
+        prompt_cache=prompt_cache,
         verbose=True,
     )
 

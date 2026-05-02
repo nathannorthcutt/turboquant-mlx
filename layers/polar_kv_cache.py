@@ -4,7 +4,8 @@ Adapts the original TurboQuant KV cache compression (Zandieh et al., 2025)
 for Apple Silicon using MLX.
 
 Architecture:
-  - Storage: TurboQuant compressed (rotation + codebook), ~4.6x at 3-bit
+  - Storage: TurboQuant compressed (rotation + codebook), independent
+    per-K and per-V bit widths
   - Attention: Dequantize to float16 → standard mx.fast.scaled_dot_product_attention
     This preserves compatibility with all model features (attention sinks,
     sliding windows, etc.) and lets MLX's Metal kernel handle precision.
@@ -13,6 +14,13 @@ Memory savings come from the persistent compressed storage. The temporary
 float16 dequantized arrays for attention are part of the lazy eval graph
 and don't persist between steps.
 
+Mixed precision (v0.2):
+  - K and V can carry independent bit widths via (k_bits, v_bits)
+  - K is more sensitive to score perturbation (softmax amplifies error);
+    keep K8 unless calibration shows otherwise
+  - V tolerates 3-bit safely on most architectures (D >= 128)
+  - Recommended default: K8 + V3 (~2.7x compression, near-lossless)
+
 Compatible with models that use attention sinks (GPT-OSS), hybrid
 attention (Qwen3.5 linear + full), and sliding windows.
 """
@@ -20,7 +28,6 @@ attention (Qwen3.5 linear + full), and sliding windows.
 import math
 
 import mlx.core as mx
-from mlx.utils import tree_map
 
 from turboquant_mlx.core.codebook import (
     get_codebook,
@@ -44,32 +51,86 @@ class TurboQuantKVCache:
     Does NOT expose ``self.bits`` — routes through standard SDPA, which
     supports attention sinks (GPT-OSS) and all other attention features.
 
-    Storage compression vs float16:
-      - 3-bit TQ: ~4.6x  (3 bits + scale only, no bias)
-      - 4-bit TQ: ~3.8x
-      - 2-bit TQ: ~7.1x
+    Parameters
+    ----------
+    tq_bits : int, optional
+        Legacy: applies the same bit width to both K and V. Mutually
+        exclusive with ``k_bits`` / ``v_bits``.
+    k_bits, v_bits : int, optional
+        Independent bit widths for keys and values. Both must be set
+        together. Mutually exclusive with ``tq_bits``.
+    group_size : int
+        Per-group RMS scaling group size (default 64).
+    seed : int
+        Rotation seed.
+    min_tokens_before_quant : int
+        Number of leading tokens kept in fp16 (Tier A) before
+        TQ-compressed storage (Tier B) takes over. Protects attention
+        sinks at the cost of a fixed fp16 buffer. 0 disables the tier
+        and is byte-equivalent to v0.1.x. Recommended: 1024.
+
+    Storage compression vs float16 (head_dim=128, group_size=64,
+    accounting for fp16 group RMS scales):
+      tq_bits=3       ~4.6x   uniform 3-bit
+      tq_bits=4       ~3.8x   uniform 4-bit
+      tq_bits=2       ~7.1x   uniform 2-bit (quality-degrading)
+      k_bits=8 v=4    ~2.6x   safe across architectures
+      k_bits=8 v=3    ~2.7x   recommended default
+      k_bits=4 v=3    ~4.0x   K starts to degrade greedy decode
     """
 
     step = 256
 
     def __init__(
         self,
-        tq_bits: int = 3,
+        tq_bits: int | None = None,
         group_size: int = 64,
         seed: int = 42,
+        *,
+        k_bits: int | None = None,
+        v_bits: int | None = None,
+        min_tokens_before_quant: int = 0,
     ):
-        # TQ storage parameters
+        if tq_bits is not None and (k_bits is not None or v_bits is not None):
+            raise ValueError(
+                "Pass either tq_bits (legacy) OR (k_bits, v_bits) — not both."
+            )
+        if (k_bits is None) ^ (v_bits is None):
+            raise ValueError("k_bits and v_bits must be set together.")
+        if tq_bits is None and k_bits is None:
+            tq_bits = 3  # historical default
+        if tq_bits is not None:
+            k_bits = tq_bits
+            v_bits = tq_bits
+        if min_tokens_before_quant < 0:
+            raise ValueError("min_tokens_before_quant must be >= 0")
+
+        # Storage state — Tier B (TQ-compressed)
         self._tq_keys = None
         self._tq_values = None
+        # Storage state — Tier A (fp16, attention-sink window)
+        self._fp16_keys = None
+        self._fp16_values = None
+        self._min_tokens_before_quant = int(min_tokens_before_quant)
         self.offset = 0
-        self._bits = tq_bits
-        self._group_size = group_size
-        self._seed = seed
+        self._k_bits = int(k_bits)
+        self._v_bits = int(v_bits)
+        self._group_size = int(group_size)
+        self._seed = int(seed)
 
-        # Precompute codebook
-        self._codebook_f32, self._boundaries_f32 = get_codebook(tq_bits, dtype=mx.float32)
-        self._codebook_f16 = self._codebook_f32.astype(mx.float16)
-        self._max_centroid = float(mx.max(mx.abs(self._codebook_f32)).item())
+        # Precompute K codebook
+        self._k_codebook_f32, self._k_boundaries_f32 = get_codebook(
+            self._k_bits, dtype=mx.float32
+        )
+        self._k_codebook_f16 = self._k_codebook_f32.astype(mx.float16)
+        self._k_max_centroid = float(mx.max(mx.abs(self._k_codebook_f32)).item())
+
+        # Precompute V codebook
+        self._v_codebook_f32, self._v_boundaries_f32 = get_codebook(
+            self._v_bits, dtype=mx.float32
+        )
+        self._v_codebook_f16 = self._v_codebook_f32.astype(mx.float16)
+        self._v_max_centroid = float(mx.max(mx.abs(self._v_codebook_f32)).item())
 
         # Rotation state (lazy-initialized on first update)
         self._k_signs = None
@@ -78,6 +139,17 @@ class TurboQuantKVCache:
         self._v_head_dim = None
         self._k_block_size = None
         self._v_block_size = None
+        self._k_gs = None
+        self._v_gs = None
+
+    # Back-compat alias: some external code may read ``cache._bits``.
+    @property
+    def _bits(self):
+        if self._k_bits == self._v_bits:
+            return self._k_bits
+        # Mixed precision — return K bits as the "primary" width since K is
+        # the precision-critical lane. Caller should prefer _k_bits/_v_bits.
+        return self._k_bits
 
     def _ensure_rotation(self, k_head_dim, v_head_dim):
         if self._k_signs is None or self._k_head_dim != k_head_dim:
@@ -112,141 +184,282 @@ class TurboQuantKVCache:
     def _unrotate(self, x, signs, block_size):
         return self._hadamard_fwd(x, block_size) * signs
 
-    def _tq_quantize(self, vectors, signs, block_size, gs, head_dim):
+    def _tq_quantize(
+        self, vectors, signs, block_size, gs, head_dim,
+        bits, boundaries, max_centroid,
+    ):
         """TurboQuant quantize: rotate → normalize → codebook → pack."""
         B, H, S, D = vectors.shape
         n_groups = D // gs
 
-        v_rot = self._rotate(vectors.astype(mx.float32), signs.astype(mx.float32), block_size)
+        v_rot = self._rotate(
+            vectors.astype(mx.float32), signs.astype(mx.float32), block_size
+        )
         v_grouped = v_rot.reshape(B, H, S, n_groups, gs)
         rms = mx.sqrt(mx.mean(v_grouped * v_grouped, axis=-1, keepdims=True))
         rms = mx.maximum(rms, mx.array(1e-7))
         v_norm = v_grouped / rms
-        v_norm = mx.clip(v_norm, -self._max_centroid * 1.5, self._max_centroid * 1.5)
+        v_norm = mx.clip(v_norm, -max_centroid * 1.5, max_centroid * 1.5)
 
-        indices = quantize_scalar(v_norm, self._boundaries_f32)
+        indices = quantize_scalar(v_norm, boundaries)
         indices_flat = indices.reshape(B, H, S, D)
-        packed = pack_indices(indices_flat, self._bits)
+        packed = pack_indices(indices_flat, bits)
         scales = rms.squeeze(-1).astype(mx.float16)
         return packed, scales
 
-    def _tq_dequantize(self, packed, scales, signs, block_size, gs, head_dim):
+    def _tq_dequantize(
+        self, packed, scales, signs, block_size, gs, head_dim,
+        bits, codebook_f16,
+    ):
         """TurboQuant dequantize: unpack → codebook → scale → unrotate."""
         B, H, S = packed.shape[:3]
         n_groups = head_dim // gs
 
-        indices = unpack_indices(packed, self._bits, head_dim)
+        indices = unpack_indices(packed, bits, head_dim)
         indices = indices.reshape(B, H, S, head_dim)
-        v_deq = dequantize_scalar(indices, self._codebook_f16)
+        v_deq = dequantize_scalar(indices, codebook_f16)
         v_deq = v_deq.reshape(B, H, S, n_groups, gs)
         v_deq = v_deq * mx.expand_dims(scales, axis=-1)
         v_deq = v_deq.reshape(B, H, S, head_dim)
-        v_deq = self._unrotate(v_deq.astype(mx.float32), signs.astype(mx.float32), block_size)
+        v_deq = self._unrotate(
+            v_deq.astype(mx.float32), signs.astype(mx.float32), block_size
+        )
         return v_deq.astype(mx.float16)
 
     def update_and_fetch(self, keys, values):
-        """Store new KV in TQ compressed format, return float16 for SDPA.
+        """Store new KV across two tiers, return float16 for SDPA.
 
-        Returns float16 arrays (keys, values) compatible with standard
+        Tier A — fp16 buffer for tokens [0, min_tokens_before_quant). Holds
+        attention sinks at full precision so they don't pay quantization
+        error.
+
+        Tier B — TQ-compressed for tokens [min_tokens_before_quant, offset).
+
+        When ``min_tokens_before_quant=0`` (default), Tier A is empty and
+        all tokens flow through Tier B exactly like v0.1.x.
+
+        Returns float16 (keys, values) compatible with standard
         mx.fast.scaled_dot_product_attention including attention sinks.
         """
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
         prev = self.offset
+        new_offset = prev + num_steps
+        threshold = self._min_tokens_before_quant
 
         self._ensure_rotation(k_head_dim, v_head_dim)
 
-        k_gs = self._k_gs
-        v_gs = self._v_gs
-        el_per_int = 32 // self._bits
-        packed_k_dim = (k_head_dim + el_per_int - 1) // el_per_int
-        packed_v_dim = (v_head_dim + el_per_int - 1) // el_per_int
-        n_groups_k = k_head_dim // k_gs
-        n_groups_v = v_head_dim // v_gs
+        # Lazy-init Tier A buffer (size fixed by threshold)
+        if threshold > 0 and self._fp16_keys is None:
+            self._fp16_keys = mx.zeros(
+                (B, n_kv_heads, threshold, k_head_dim), dtype=mx.float16
+            )
+            self._fp16_values = mx.zeros(
+                (B, n_kv_heads, threshold, v_head_dim), dtype=mx.float16
+            )
 
-        # Allocate or expand TQ storage
-        if self._tq_keys is None or (prev + num_steps) > self._tq_keys[0].shape[-2]:
-            new_steps = (self.step + num_steps - 1) // self.step * self.step
-            shape = (B, n_kv_heads, new_steps)
+        # Split this batch into A-bound and B-bound segments
+        a_end = min(new_offset, threshold)
+        a_count = max(0, a_end - prev)
+        b_count = num_steps - a_count
 
-            def _init(pd, ng):
+        # Tier A append (fp16, no quantization)
+        if a_count > 0:
+            self._fp16_keys[..., prev : prev + a_count, :] = (
+                keys[..., :a_count, :].astype(mx.float16)
+            )
+            self._fp16_values[..., prev : prev + a_count, :] = (
+                values[..., :a_count, :].astype(mx.float16)
+            )
+
+        # Tier B append (TQ-compressed). b_prev counts from the start of
+        # Tier B (absolute position threshold maps to b-position 0).
+        if b_count > 0:
+            b_keys = keys[..., a_count:, :]
+            b_values = values[..., a_count:, :]
+            b_prev = max(0, prev - threshold)
+            b_new = b_prev + b_count
+
+            k_gs = self._k_gs
+            v_gs = self._v_gs
+            k_el_per_int = 32 // self._k_bits
+            v_el_per_int = 32 // self._v_bits
+            packed_k_dim = (k_head_dim + k_el_per_int - 1) // k_el_per_int
+            packed_v_dim = (v_head_dim + v_el_per_int - 1) // v_el_per_int
+            n_groups_k = k_head_dim // k_gs
+            n_groups_v = v_head_dim // v_gs
+
+            # Allocate or expand TQ storage
+            if (
+                self._tq_keys is None
+                or b_new > self._tq_keys[0].shape[-2]
+            ):
+                new_steps = (self.step + b_count - 1) // self.step * self.step
+                # Round up to fit b_new
+                while b_prev + new_steps < b_new:
+                    new_steps += self.step
+                shape = (B, n_kv_heads, new_steps)
+
+                def _init(pd, ng):
+                    return (
+                        mx.zeros((*shape, pd), dtype=mx.uint32),
+                        mx.zeros((*shape, ng), dtype=mx.float16),
+                    )
+
+                def _expand(x):
+                    pad = mx.zeros(
+                        (B, n_kv_heads, new_steps, x.shape[-1]), dtype=x.dtype
+                    )
+                    return mx.concatenate([x, pad], axis=-2)
+
+                if self._tq_keys is not None:
+                    if b_prev % self.step != 0:
+                        self._tq_keys = tuple(
+                            x[..., :b_prev, :] for x in self._tq_keys
+                        )
+                        self._tq_values = tuple(
+                            x[..., :b_prev, :] for x in self._tq_values
+                        )
+                    self._tq_keys = tuple(_expand(x) for x in self._tq_keys)
+                    self._tq_values = tuple(_expand(x) for x in self._tq_values)
+                else:
+                    self._tq_keys = _init(packed_k_dim, n_groups_k)
+                    self._tq_values = _init(packed_v_dim, n_groups_v)
+
+            # Quantize and store the B-bound segment
+            k_packed, k_scales = self._tq_quantize(
+                b_keys, self._k_signs, self._k_block_size, k_gs, k_head_dim,
+                self._k_bits, self._k_boundaries_f32, self._k_max_centroid,
+            )
+            v_packed, v_scales = self._tq_quantize(
+                b_values, self._v_signs, self._v_block_size, v_gs, v_head_dim,
+                self._v_bits, self._v_boundaries_f32, self._v_max_centroid,
+            )
+            self._tq_keys[0][..., b_prev:b_new, :] = k_packed
+            self._tq_keys[1][..., b_prev:b_new, :] = k_scales
+            self._tq_values[0][..., b_prev:b_new, :] = v_packed
+            self._tq_values[1][..., b_prev:b_new, :] = v_scales
+
+        self.offset = new_offset
+
+        # Fetch: concat Tier A (fp16) + Tier B (dequantized)
+        b_total = max(0, new_offset - threshold)
+        if b_total > 0:
+            k_deq_b = self._tq_dequantize(
+                self._tq_keys[0][..., :b_total, :],
+                self._tq_keys[1][..., :b_total, :],
+                self._k_signs, self._k_block_size, self._k_gs, k_head_dim,
+                self._k_bits, self._k_codebook_f16,
+            )
+            v_deq_b = self._tq_dequantize(
+                self._tq_values[0][..., :b_total, :],
+                self._tq_values[1][..., :b_total, :],
+                self._v_signs, self._v_block_size, self._v_gs, v_head_dim,
+                self._v_bits, self._v_codebook_f16,
+            )
+        else:
+            k_deq_b = None
+            v_deq_b = None
+
+        if a_end > 0:
+            a_keys_view = self._fp16_keys[..., :a_end, :]
+            a_values_view = self._fp16_values[..., :a_end, :]
+            if k_deq_b is not None:
                 return (
-                    mx.zeros((*shape, pd), dtype=mx.uint32),
-                    mx.zeros((*shape, ng), dtype=mx.float16),
+                    mx.concatenate([a_keys_view, k_deq_b], axis=-2),
+                    mx.concatenate([a_values_view, v_deq_b], axis=-2),
                 )
-
-            def _expand(x):
-                pad = mx.zeros((B, n_kv_heads, new_steps, x.shape[-1]), dtype=x.dtype)
-                return mx.concatenate([x, pad], axis=-2)
-
-            if self._tq_keys is not None:
-                if prev % self.step != 0:
-                    self._tq_keys = tuple(x[..., :prev, :] for x in self._tq_keys)
-                    self._tq_values = tuple(x[..., :prev, :] for x in self._tq_values)
-                self._tq_keys = tuple(_expand(x) for x in self._tq_keys)
-                self._tq_values = tuple(_expand(x) for x in self._tq_values)
-            else:
-                self._tq_keys = _init(packed_k_dim, n_groups_k)
-                self._tq_values = _init(packed_v_dim, n_groups_v)
-
-        self.offset += num_steps
-
-        # TQ quantize incoming tokens
-        k_packed, k_scales = self._tq_quantize(
-            keys, self._k_signs, self._k_block_size, k_gs, k_head_dim
-        )
-        v_packed, v_scales = self._tq_quantize(
-            values, self._v_signs, self._v_block_size, v_gs, v_head_dim
-        )
-
-        # Store in TQ format
-        self._tq_keys[0][..., prev : self.offset, :] = k_packed
-        self._tq_keys[1][..., prev : self.offset, :] = k_scales
-        self._tq_values[0][..., prev : self.offset, :] = v_packed
-        self._tq_values[1][..., prev : self.offset, :] = v_scales
-
-        # Dequantize full TQ cache → float16 for attention
-        k_deq = self._tq_dequantize(
-            self._tq_keys[0][..., : self.offset, :],
-            self._tq_keys[1][..., : self.offset, :],
-            self._k_signs, self._k_block_size, k_gs, k_head_dim,
-        )
-        v_deq = self._tq_dequantize(
-            self._tq_values[0][..., : self.offset, :],
-            self._tq_values[1][..., : self.offset, :],
-            self._v_signs, self._v_block_size, v_gs, v_head_dim,
-        )
-
-        return k_deq, v_deq
+            return a_keys_view, a_values_view
+        return k_deq_b, v_deq_b
 
     @property
     def state(self):
-        if self._tq_keys is None:
+        # Returns (tq_keys, tq_values, fp16_keys, fp16_values). Older
+        # 2-tuple form is also accepted by the setter for backwards compat.
+        threshold = self._min_tokens_before_quant
+        if self._tq_keys is None and self._fp16_keys is None:
             return []
-        if self.offset == self._tq_keys[0].shape[2]:
-            return self._tq_keys, self._tq_values
-        return (
-            tuple(x[..., : self.offset, :] for x in self._tq_keys),
-            tuple(x[..., : self.offset, :] for x in self._tq_values),
-        )
+
+        b_total = max(0, self.offset - threshold)
+        if self._tq_keys is None:
+            tq_pair = (None, None)
+        elif b_total == self._tq_keys[0].shape[2]:
+            tq_pair = (self._tq_keys, self._tq_values)
+        else:
+            tq_pair = (
+                tuple(x[..., :b_total, :] for x in self._tq_keys),
+                tuple(x[..., :b_total, :] for x in self._tq_values),
+            )
+
+        a_end = min(self.offset, threshold)
+        if self._fp16_keys is None or a_end == 0:
+            fp_pair = (None, None)
+        else:
+            fp_pair = (
+                self._fp16_keys[..., :a_end, :],
+                self._fp16_values[..., :a_end, :],
+            )
+
+        return (tq_pair[0], tq_pair[1], fp_pair[0], fp_pair[1])
 
     @state.setter
     def state(self, v):
-        if v is not None and v:
+        if not v:
+            return
+        # 2-tuple legacy form: (tq_keys, tq_values)
+        if len(v) == 2:
             self._tq_keys, self._tq_values = v
+            return
+        # 4-tuple form: (tq_keys, tq_values, fp16_keys, fp16_values)
+        if len(v) == 4:
+            tq_k, tq_v, fp_k, fp_v = v
+            self._tq_keys = tq_k
+            self._tq_values = tq_v
+            self._fp16_keys = fp_k
+            self._fp16_values = fp_v
+            return
+        raise ValueError(
+            f"Unexpected state length {len(v)}; expected 2 or 4."
+        )
 
     @property
     def meta_state(self):
+        # Forward-compat 6-tuple:
+        # (offset, k_bits, v_bits, group_size, seed, min_tokens_before_quant)
         return tuple(
-            map(str, (self.offset, self._bits, self._group_size, self._seed))
+            map(str, (
+                self.offset, self._k_bits, self._v_bits,
+                self._group_size, self._seed,
+                self._min_tokens_before_quant,
+            ))
         )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.offset = int(v[0])
-        self._bits = int(v[1])
-        self._group_size = int(v[2])
-        self._seed = int(v[3])
+        # Accept legacy 4-tuple, item-#1 5-tuple, and item-#2 6-tuple forms.
+        if len(v) == 4:
+            self.offset = int(v[0])
+            self._k_bits = int(v[1])
+            self._v_bits = int(v[1])
+            self._group_size = int(v[2])
+            self._seed = int(v[3])
+        elif len(v) == 5:
+            self.offset = int(v[0])
+            self._k_bits = int(v[1])
+            self._v_bits = int(v[2])
+            self._group_size = int(v[3])
+            self._seed = int(v[4])
+        elif len(v) == 6:
+            self.offset = int(v[0])
+            self._k_bits = int(v[1])
+            self._v_bits = int(v[2])
+            self._group_size = int(v[3])
+            self._seed = int(v[4])
+            self._min_tokens_before_quant = int(v[5])
+        else:
+            raise ValueError(
+                f"Unexpected meta_state length {len(v)}; expected 4, 5, or 6."
+            )
 
     def is_trimmable(self):
         return True
@@ -260,18 +473,27 @@ class TurboQuantKVCache:
         return self.offset
 
     def empty(self):
-        return self._tq_keys is None
+        return self._tq_keys is None and self._fp16_keys is None
 
     @property
     def nbytes(self):
-        """Return TQ compressed cache size in bytes (persistent storage)."""
-        if self._tq_keys is None:
-            return 0
+        """Return total cache size in bytes (Tier A fp16 + Tier B compressed)."""
+        threshold = self._min_tokens_before_quant
         total = 0
-        for arr in self._tq_keys:
-            total += arr[..., : self.offset, :].nbytes
-        for arr in self._tq_values:
-            total += arr[..., : self.offset, :].nbytes
+
+        # Tier A
+        a_end = min(self.offset, threshold)
+        if self._fp16_keys is not None and a_end > 0:
+            total += self._fp16_keys[..., :a_end, :].nbytes
+            total += self._fp16_values[..., :a_end, :].nbytes
+
+        # Tier B
+        b_total = max(0, self.offset - threshold)
+        if self._tq_keys is not None and b_total > 0:
+            for arr in self._tq_keys:
+                total += arr[..., :b_total, :].nbytes
+            for arr in self._tq_values:
+                total += arr[..., :b_total, :].nbytes
         return total
 
     def make_mask(self, N, window_size=None, return_array=False):
@@ -281,16 +503,44 @@ class TurboQuantKVCache:
                                      window_size=window_size)
 
 
-def make_turboquant_cache(model, tq_bits=3, group_size=64, seed=42):
-    """Create TurboQuant KV caches for all layers."""
+def make_turboquant_cache(
+    model,
+    tq_bits: int | None = None,
+    group_size: int = 64,
+    seed: int = 42,
+    *,
+    k_bits: int | None = None,
+    v_bits: int | None = None,
+    min_tokens_before_quant: int = 0,
+):
+    """Create TurboQuant KV caches for all layers.
+
+    Pass ``tq_bits`` for symmetric K/V (legacy) or ``(k_bits, v_bits)`` for
+    mixed precision. ``min_tokens_before_quant`` keeps the first N tokens
+    in fp16 (recommended: 1024) to protect attention sinks. See
+    ``TurboQuantKVCache`` for details.
+    """
     num_layers = len(model.layers)
     return [
-        TurboQuantKVCache(tq_bits=tq_bits, group_size=group_size, seed=seed)
+        TurboQuantKVCache(
+            tq_bits=tq_bits, group_size=group_size, seed=seed,
+            k_bits=k_bits, v_bits=v_bits,
+            min_tokens_before_quant=min_tokens_before_quant,
+        )
         for _ in range(num_layers)
     ]
 
 
-def convert_cache_to_turboquant(prompt_cache, tq_bits=3, group_size=64, seed=42):
+def convert_cache_to_turboquant(
+    prompt_cache,
+    tq_bits: int | None = None,
+    group_size: int = 64,
+    seed: int = 42,
+    *,
+    k_bits: int | None = None,
+    v_bits: int | None = None,
+    min_tokens_before_quant: int = 0,
+):
     """Convert KVCache entries in a prompt cache list to TurboQuantKVCache.
 
     Only converts standard KVCache instances. Other cache types
@@ -306,7 +556,11 @@ def convert_cache_to_turboquant(prompt_cache, tq_bits=3, group_size=64, seed=42)
             new_cache.append(c)
             continue
 
-        tq = TurboQuantKVCache(tq_bits=tq_bits, group_size=group_size, seed=seed)
+        tq = TurboQuantKVCache(
+            tq_bits=tq_bits, group_size=group_size, seed=seed,
+            k_bits=k_bits, v_bits=v_bits,
+            min_tokens_before_quant=min_tokens_before_quant,
+        )
         if c.keys is not None and c.offset > 0:
             keys = c.keys[..., : c.offset, :]
             values = c.values[..., : c.offset, :]

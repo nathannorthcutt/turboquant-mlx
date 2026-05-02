@@ -15,13 +15,13 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
     Args:
         indices: Integer indices of shape (..., N) where N is divisible
                  by elements_per_uint32. Values must be in [0, 2^bits).
-        bits: Bits per index (2, 3, or 4).
+        bits: Bits per index (2..8 inclusive).
 
     Returns:
         Packed uint32 array of shape (..., N * bits / 32).
     """
-    if bits not in (2, 3, 4):
-        raise ValueError(f"bits must be 2, 3, or 4, got {bits}")
+    if not 2 <= bits <= 8:
+        raise ValueError(f"bits must be in [2, 8], got {bits}")
 
     elems_per_u32 = 32 // bits
     *batch_shape, n = indices.shape
@@ -56,14 +56,14 @@ def unpack_indices(packed: mx.array, bits: int, count: int) -> mx.array:
 
     Args:
         packed: Packed uint32 array of shape (..., M).
-        bits: Bits per index (2, 3, or 4).
+        bits: Bits per index (2..8 inclusive).
         count: Number of indices to unpack (may be less than M * 32/bits).
 
     Returns:
         Unpacked indices of shape (..., count), dtype uint8.
     """
-    if bits not in (2, 3, 4):
-        raise ValueError(f"bits must be 2, 3, or 4, got {bits}")
+    if not 2 <= bits <= 8:
+        raise ValueError(f"bits must be in [2, 8], got {bits}")
 
     elems_per_u32 = 32 // bits
     mask = mx.array((1 << bits) - 1, dtype=mx.uint32)

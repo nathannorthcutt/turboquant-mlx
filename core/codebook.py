@@ -4,7 +4,14 @@ These centroids are mathematically optimal (minimize MSE) for quantizing
 Gaussian-distributed values. After Hadamard rotation, weight coordinates
 follow approximately N(0, sigma^2), so scaling these by sigma gives
 optimal quantization for any variance.
+
+Tables for bits 2/3/4 are precomputed for backwards compatibility.
+Higher bit widths (5-8) are computed on first request via Lloyd-Max
+iteration on N(0,1) using closed-form truncated-Gaussian conditional
+means, then cached.
 """
+
+import math
 
 import mlx.core as mx
 
@@ -94,18 +101,98 @@ _centroids_cache: dict[tuple[int, mx.Dtype], mx.array] = {}
 _boundaries_cache: dict[tuple[int, mx.Dtype], mx.array] = {}
 
 
+_SUPPORTED_BITS = range(2, 9)  # 2..8 inclusive
+_SQRT_2 = math.sqrt(2.0)
+_SQRT_2PI = math.sqrt(2.0 * math.pi)
+
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / _SQRT_2PI
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / _SQRT_2))
+
+
+def _compute_lloyd_max_gaussian(bits: int, max_iter: int = 500, tol: float = 1e-12):
+    """Iterative Lloyd-Max for N(0,1).
+
+    Uses closed-form conditional means of truncated Gaussian regions to
+    update centroids each step. Converges in ~30 iterations for bits up
+    to 8. Returns (centroids, boundaries) as Python lists.
+    """
+    K = 1 << bits  # 2 ** bits
+    # Initialize centroids on a uniform grid spanning ~±3σ
+    centroids = [(-1.0 + 2.0 * (i + 0.5) / K) * 3.0 for i in range(K)]
+
+    for _ in range(max_iter):
+        # Boundaries are midpoints of adjacent centroids
+        boundaries = [(centroids[i] + centroids[i + 1]) / 2.0 for i in range(K - 1)]
+
+        new_centroids = [0.0] * K
+
+        # First region: (-inf, b0]
+        b0 = boundaries[0]
+        cdf_b0 = _norm_cdf(b0)
+        if cdf_b0 > 1e-30:
+            new_centroids[0] = -_norm_pdf(b0) / cdf_b0
+        else:
+            new_centroids[0] = centroids[0]
+
+        # Last region: [b_last, +inf)
+        bL = boundaries[-1]
+        sf_bL = 1.0 - _norm_cdf(bL)
+        if sf_bL > 1e-30:
+            new_centroids[-1] = _norm_pdf(bL) / sf_bL
+        else:
+            new_centroids[-1] = centroids[-1]
+
+        # Middle regions: [b[i-1], b[i]]
+        for i in range(1, K - 1):
+            lo = boundaries[i - 1]
+            hi = boundaries[i]
+            num = _norm_pdf(lo) - _norm_pdf(hi)
+            den = _norm_cdf(hi) - _norm_cdf(lo)
+            if den > 1e-30:
+                new_centroids[i] = num / den
+            else:
+                new_centroids[i] = centroids[i]
+
+        max_delta = max(abs(a - b) for a, b in zip(new_centroids, centroids))
+        centroids = new_centroids
+        if max_delta < tol:
+            break
+
+    boundaries = [(centroids[i] + centroids[i + 1]) / 2.0 for i in range(K - 1)]
+    return centroids, boundaries
+
+
+def _ensure_table(bits: int):
+    """Populate CENTROIDS[bits] / BOUNDARIES[bits] on first request."""
+    if bits in CENTROIDS:
+        return
+    if bits not in _SUPPORTED_BITS:
+        raise ValueError(
+            f"Unsupported bit-width {bits}. Must be in {list(_SUPPORTED_BITS)}."
+        )
+    centroids, boundaries = _compute_lloyd_max_gaussian(bits)
+    CENTROIDS[bits] = centroids
+    BOUNDARIES[bits] = boundaries
+
+
 def get_codebook(bits: int, dtype: mx.Dtype = mx.float16) -> tuple[mx.array, mx.array]:
     """Get Lloyd-Max centroids and boundaries for a given bit-width.
 
     Args:
-        bits: Quantization bit-width (2, 3, or 4).
+        bits: Quantization bit-width (2..8). Tables for 2/3/4 are
+            precomputed; 5..8 are computed on first request and cached.
         dtype: Output dtype for the arrays.
 
     Returns:
-        (centroids, boundaries) as mx.arrays of shape (2^bits,) and (2^bits - 1,).
+        (centroids, boundaries) as mx.arrays of shape (2^bits,) and
+        (2^bits - 1,).
     """
-    if bits not in CENTROIDS:
-        raise ValueError(f"Unsupported bit-width {bits}. Must be 2, 3, or 4.")
+    _ensure_table(bits)
 
     c_key = (bits, dtype)
     if c_key not in _centroids_cache:

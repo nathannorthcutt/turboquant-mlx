@@ -25,7 +25,7 @@ Supports dense models (LLaMA, Qwen, Mistral), **Mixture-of-Experts** (Qwen-MoE, 
 | **Nemotron-3-Nano-4B** | **TurboQuant** | **3** | **—** | **~2.2 GB** | **75.6 tok/s** |
 | Nemotron-3-Super-120B-A12B | BF16 (original) | 16 | — | ~240 GB | *Doesn't fit 64GB* |
 | **Nemotron-3-Super-120B-A12B** | **TurboQuant** | **3** | **—** | **~50 GB** | **18.7 tok/s** |
-| **[Nemotron-3-Super-120B-A12B (hybrid for 48GB)](https://huggingface.co/manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32)** | **TQ 3-attn / 2-experts, gs=32** | **2/3 mix** | **—** | **~36 GB** | **~22.5 tok/s** |
+| **[Nemotron-3-Super-120B-A12B (hybrid for 48GB)](https://huggingface.co/manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32)** | **TQ 3-attn / 2-experts, gs=32** | **2/3 mix** | **—** | **~36 GB** | **~27.2 tok/s** |
 
 ## Key Results — KV Cache Compression
 
@@ -101,7 +101,7 @@ python -m turboquant_mlx.convert \
 ### 2. Generate text
 
 ```bash
-python -m turboquant_mlx.generate \
+turboquant-generate \\
     --model ./gpt-oss-20b-tq2 \
     --prompt "Why is the sky blue? Explain in simple terms." \
     --max-tokens 200
@@ -118,24 +118,29 @@ python -m turboquant_mlx.evaluate \
 
 ### 4. Generate with KV cache compression
 
+The production `turboquant-generate` CLI accepts KV-cache flags directly (v0.2+).
+Use mixed K/V precision (`--kv-k-bits 8 --kv-v-bits 3`) — required for
+TurboQuant-quantized weights, and lossless on stock fp16 weights:
+
 ```bash
-# Standard model + KV cache compression
-python -m turboquant_mlx.demo_kv \
+# v0.2 recommended default: mixed K8/V3 + 128-token fp16 sink
+turboquant-generate \
+    --model ./gpt-oss-120b-tq3 \
+    --prompt "Why is the sky blue?" \
+    --max-tokens 1024 --temp 0.7 \
+    --kv-k-bits 8 --kv-v-bits 3 --kv-min-tokens 128
+
+# Symmetric (legacy) — only safe on fp16 weights
+turboquant-generate \
     --model openai/gpt-oss-20b \
     --prompt "Why is the sky blue?" \
-    --max-tokens 200 --tq-bits 3
+    --max-tokens 200 --kv-bits 3
 
-# TQ-compressed model + KV cache compression (full stack)
-python -m turboquant_mlx.demo_kv \
+# Side-by-side comparison harness (4 configs in one run)
+python -m turboquant_mlx.benchmarks.demo_kv_v02 \
     --model ./gpt-oss-120b-tq3 \
     --prompt "Why is the sky blue?" \
-    --max-tokens 200 --tq-bits 3
-
-# Side-by-side comparison: FP16 KV vs TurboQuant KV
-python -m turboquant_mlx.demo_kv \
-    --model ./gpt-oss-120b-tq3 \
-    --prompt "Why is the sky blue?" \
-    --max-tokens 200 --compare
+    --max-tokens 1024 --temp 0.7 --top-p 0.9 --repetition-penalty 1.1
 ```
 
 ### 5. Serve a TurboQuant model over an OpenAI-compatible API
@@ -271,25 +276,63 @@ TurboQuant KV cache compression applies the same Hadamard rotation + Lloyd-Max c
 from turboquant_mlx.layers import convert_cache_to_turboquant
 from mlx_lm.models.cache import make_prompt_cache
 
-# 1. Process the prompt with FP16 KV cache (exact)
+# 1. Build per-layer cache (correct types for hybrid models)
 cache = make_prompt_cache(model)
+
+# 2. Convert to TurboQuant KV cache (v0.2 mixed K/V + sink protection)
+cache = convert_cache_to_turboquant(
+    cache,
+    k_bits=8, v_bits=3,           # K-precision-critical, V tolerates 3-bit
+    min_tokens_before_quant=128,  # keep first 128 tokens fp16 (attention sinks)
+    group_size=64,
+)
+
+# 3. Process the prompt and generate — cache is compressed from token 128+
 model(prompt_tokens, cache=cache)
-
-# 2. Convert to TurboQuant KV cache for generation
-cache = convert_cache_to_turboquant(cache, tq_bits=3, group_size=64)
-
-# 3. Continue generation — cache is now compressed
 for token in generate_loop(model, cache):
     ...
 ```
 
-### Choosing a bit-width
+> **v0.1 → v0.2 migration:** `tq_bits=3` still works (symmetric K=V=3) but is
+> not recommended on TurboQuant-quantized weights. Pass `k_bits=8, v_bits=3`
+> instead. Pre-existing checkpoints and code paths are fully backward compatible.
 
-| Weights | KV cache | Recommendation |
-|---------|----------|----------------|
-| FP16 / BF16 | TQ 3-bit | Default sweet spot at every model size |
-| TQ-compressed (~20B) | TQ 4-bit | Use 4-bit when stacking on TQ weights — small models have a tighter noise budget |
-| **TQ-compressed (100B+)** | **TQ 3-bit** | **3-bit on 3-bit works cleanly on GPT-OSS-120B and Qwen3.5-122B — 100B+ models have enough redundancy to absorb the stacked noise** |
+### Choosing a bit-width (v0.2)
+
+K precision matters far more than V precision: softmax amplifies any K error,
+while V tolerates aggressive quantization. Mixed K8/V3 is the new default.
+
+| Weights | K bits | V bits | sink | When to use |
+|---------|-------:|-------:|-----:|-------------|
+| FP16 / BF16 | 8 | 3 | 128 | Default — lossless quality, ~4× smaller cache |
+| FP16 / BF16 | 4 | 3 | 128 | More aggressive; small quality dip on dense attention |
+| **TurboQuant-quantized** | **8** | **3** | **128** | **Required on tq3 weights — symmetric K3 collapses past ~1k generated tokens** |
+| Any | 8 | 4 | 128 | Highest fidelity TQ KV setting |
+
+**Why K8 specifically on TurboQuant weights:** stacking 3-bit K cache on top of
+already-3-bit weight quantization compounds the noise enough to break long-form
+generation on GPT-OSS-20B (we observed total output collapse past ~800 tokens
+with `K3_V3` on tq3 weights, while `K8_V3` is clean). The same `K3_V3` cache is
+fine on stock fp16 weights — the failure mode is co-compression, not the cache
+alone.
+
+### CLI flags
+
+`turboquant-generate` exposes the same controls:
+
+```bash
+turboquant-generate --model ./model-tq3 --prompt "..." \
+    --kv-k-bits 8 --kv-v-bits 3 \
+    --kv-min-tokens 128 \
+    --kv-group-size 64
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--kv-bits N` | Symmetric K=V=N (legacy v0.1) |
+| `--kv-k-bits` / `--kv-v-bits` | Mixed precision (v0.2 recommended) |
+| `--kv-min-tokens N` | Keep the first N cached tokens in fp16 (sink protection) |
+| `--kv-group-size N` | Hadamard rotation group size (default 64) |
 
 ### The speed flip
 
@@ -339,7 +382,7 @@ The converter automatically:
 #### Step 2: Generate text
 
 ```bash
-python -m turboquant_mlx.generate \
+turboquant-generate \\
     --model ./gpt-oss-20b-tq3 \
     --prompt "Explain quantum entanglement to a 10-year-old." \
     --max-tokens 256
@@ -398,7 +441,7 @@ python -m turboquant_mlx.convert \
 #### Step 2: Generate text
 
 ```bash
-python -m turboquant_mlx.generate \
+turboquant-generate \\
     --model ./gpt-oss-120b-tq3 \
     --prompt "Explain quantum computing in simple terms." \
     --max-tokens 200
@@ -451,7 +494,7 @@ python -m turboquant_mlx.convert \
 #### Step 2: Generate text
 
 ```bash
-python -m turboquant_mlx.generate \
+turboquant-generate \\
     --model ./qwen3.5-122b-tq3 \
     --prompt "Why is the sky blue? Explain in simple terms." \
     --max-tokens 200
@@ -500,7 +543,7 @@ python -m turboquant_mlx.convert \
 Nemotron-3's chat template ends in a `<think>\n` scaffold that primes EOS as the top-1 logit at the start of the assistant turn. Pass `--min-tokens` to mask EOS for the first N tokens so the model enters the think phase:
 
 ```bash
-python -m turboquant_mlx.generate \
+turboquant-generate \\
     --model ./nemotron-3-super-120b-tq3 \
     --prompt "Why is the sky blue?" \
     --max-tokens 200 --min-tokens 50
@@ -512,7 +555,7 @@ python -m turboquant_mlx.generate \
 |-------|------|------|----------|-----------|---------|
 | **Nemotron-3-Nano-4B** | **3** | **~2.2 GB** | **4.3 GB** | **75.6 tok/s** | **Coherent** |
 | **Nemotron-3-Super-120B-A12B** | **3** | **~50 GB** | **54.7 GB** | **18.7 tok/s** | **Coherent with structured `<think>` reasoning (974-token answer w/ self-correction, formulas, formatted structure)** |
-| **Nemotron-3-Super-120B-A12B (hybrid)** | **3-attn / 2-experts, gs=32** | **~36 GB** | **~40 GB** | **~22.5 tok/s** | **Coherent prose, code, format, and long-context recall; math accuracy degraded — see Phase-1 note below** |
+| **Nemotron-3-Super-120B-A12B (hybrid)** | **3-attn / 2-experts, gs=32** | **~36 GB** | **~40.8 GB** | **~27.2 tok/s** | **Coherent prose, code, format, and long-context recall; math accuracy degraded — see Phase-1 note below** |
 
 #### 48 GB-RAM target: hybrid (3-bit attention / 2-bit experts) at group-size 32
 
@@ -531,8 +574,8 @@ hf download manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32 \
 ```
 
 → [`manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32`](https://huggingface.co/manjunathshiva/Nemotron-3-Super-120B-A12B-tq3a-tq2e-g32)
-on the Hub: ~36 GB on disk, ~40 GB peak memory, fits a default 48 GB
-`iogpu.wired_limit_mb` cap.
+on the Hub: ~36 GB on disk, ~40.8 GB peak memory, ~27.2 tok/s decode, fits the
+default 48 GB `iogpu.wired_limit_mb` cap.
 
 **Or convert from BF16 source yourself:**
 
@@ -549,7 +592,7 @@ avoid degenerate tail loops at >1500 tokens. The recommended decode config
 recall clean):
 
 ```bash
-python -m turboquant_mlx.generate \
+turboquant-generate \\
     --model ./nemotron-3-super-120b-tq3a-tq2e-g32 \
     --prompt "Why is the sky blue?" \
     --max-tokens 4096 --min-tokens 50 \
