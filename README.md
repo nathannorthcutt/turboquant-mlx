@@ -2,9 +2,11 @@
 
 Extreme **weight** and **KV cache** compression for LLMs on Apple Silicon. MLX implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) — Hadamard rotation + Lloyd-Max codebooks applied both to weights (compile time) and the KV cache (run time).
 
-Supports dense models (LLaMA, Qwen, Mistral), **Mixture-of-Experts** (Qwen-MoE, GPT-OSS, Qwen3.5-MoE), and **Mamba/attention hybrids** (Nemotron-3-Nano-4B, Nemotron-3-Super-120B). Compatible with hybrid attention architectures, attention sinks, sliding-window attention, and linear attention layers.
+Supports dense models (LLaMA, Qwen, Mistral), **Mixture-of-Experts** (Qwen-MoE, GPT-OSS, Qwen3.5-MoE, Qwen3.6-35B-A3B), and **Mamba/attention hybrids** (Nemotron-3-Nano-4B, Nemotron-3-Super-120B). Compatible with hybrid attention architectures, attention sinks, sliding-window attention, and linear attention layers.
 
 **With both weight and KV cache compression at 3-bit, GPT-OSS-120B fits its full 131K context window in 50 GB on a 64 GB MacBook — and KV cache compression actually makes generation *faster* on the 120B (8.7 vs 6.4 tok/s) because the smaller cache cuts memory bandwidth more than dequant costs.**
+
+**Expert streaming (v0.4.0)** runs MoE models whose weights exceed available RAM by paging only the router-selected experts from disk per token — e.g. the 35B-parameter Qwen3.6-35B-A3B runs on a **16 GB Mac mini** in under 4 GB of RAM, with output bit-identical to the fully-resident model. See [Qwen3.6-35B-A3B on a 16 GB Mac mini](#qwen36-35b-a3b-on-a-16-gb-mac-mini-expert-streaming).
 
 ## Key Results — Weight Compression
 
@@ -23,6 +25,7 @@ Supports dense models (LLaMA, Qwen, Mistral), **Mixture-of-Experts** (Qwen-MoE, 
 | GPT-OSS-120B | TurboQuant | 2 | — | 32 GB | 51 tok/s (poor quality) |
 | Qwen3.5-122B-A10B | BF16 (original) | 16 | — | ~240 GB | *Doesn't fit 64GB* |
 | **Qwen3.5-122B-A10B** | **TurboQuant** | **3** | **—** | **~50 GB** | **26.5 tok/s** |
+| **[Qwen3.6-35B-A3B](https://huggingface.co/manjunathshiva/Qwen3.6-35B-A3B-tq3-g32)** | **TurboQuant, gs=32** | **3** | **—** | **~16 GB** | **~60 tok/s (resident) · runs in <4 GB via streaming** |
 | **Nemotron-3-Nano-4B** | **TurboQuant** | **3** | **—** | **~2.2 GB** | **75.6 tok/s** |
 | Nemotron-3-Super-120B-A12B | BF16 (original) | 16 | — | ~240 GB | *Doesn't fit 64GB* |
 | **Nemotron-3-Super-120B-A12B** | **TurboQuant** | **3** | **—** | **~50 GB** | **18.7 tok/s** |
@@ -514,6 +517,47 @@ turboquant-generate \\
 
 ---
 
+### Qwen3.6-35B-A3B on a 16 GB Mac mini (expert streaming)
+
+**Hardware:** Apple M4 Max 64GB to convert; runs **fully resident on 64 GB** or on a **16 GB Mac mini via expert streaming**. Qwen3.6-35B-A3B is a hybrid linear-attention (`qwen3_5_moe`, qwen3_next-style) + MoE model — **256 routed experts (top-8) + 1 shared**, ~35B total / ~3B active. The text-only language model is extracted (the vision tower is dropped during conversion).
+
+A pre-converted 3-bit (group-size 32) model is on the Hub:
+
+→ [`manjunathshiva/Qwen3.6-35B-A3B-tq3-g32`](https://huggingface.co/manjunathshiva/Qwen3.6-35B-A3B-tq3-g32) — ~16 GB on disk; ~60 tok/s at ~18 GB peak when fully resident on a 64 GB Mac.
+
+#### Run it fully resident (64 GB)
+
+```bash
+turboquant-generate \
+    --model manjunathshiva/Qwen3.6-35B-A3B-tq3-g32 \
+    --prompt "Explain why the sky is blue." \
+    --max-tokens 512
+```
+
+#### Run it on a 16 GB Mac mini (expert streaming)
+
+The model is ~16 GB on disk, so it won't fit fully resident in 16 GB alongside the OS (resident decode peaks ~18 GB). Expert streaming pages only the router-selected experts from disk per token (LRU-cached), keeping resident memory to a few GB. Output is **bit-identical** to the fully-resident model. (`os.pread` + macOS `F_NOCACHE` keep the OS page cache from ballooning while streaming.)
+
+```bash
+python -m turboquant_mlx.stream.stream_generate \
+    --model manjunathshiva/Qwen3.6-35B-A3B-tq3-g32 \
+    --prompt "Explain why the sky is blue." \
+    --max-tokens 512 --cache-budget-gb 8
+```
+
+#### Benchmark (base Apple M4 Mac mini, 16 GB)
+
+| Config | Expert hit-rate | Disk read / token | Decode | Peak RSS |
+|--------|-----------------|-------------------|--------|----------|
+| `--cache-budget-gb 2` | ~60% | ~175 MB | ~3.0 tok/s | **3.9 GB** |
+| `--cache-budget-gb 8` *(recommended)* | **91%** | ~41 MB | **~4.5 tok/s** | 9.4 GB |
+
+A larger cache keeps more experts resident, raising the hit-rate and cutting SSD reads — the throughput limiter when streaming. `--cache-budget-gb 8` is the sweet spot on a 16 GB machine; drop to `2` if RAM is tight. Streaming currently targets the `qwen3_5_moe` expert layout.
+
+> **Note:** Qwen3.6 is a thinking-mode model — it emits a reasoning trace before the final answer, so give it a generous `--max-tokens` (512+) for tasks that need a concluding answer.
+
+---
+
 ### Nemotron-3 (Mamba/attention hybrid)
 
 Nemotron-3 is NVIDIA's hybrid Mamba2 + attention architecture. Two variants are tested:
@@ -654,7 +698,7 @@ Options:
 | Mistral | `mistral` | No | Tested |
 | Qwen1.5-MoE | `qwen2_moe` | Yes | Tested |
 | GPT-OSS | `gpt_oss` | Yes | Tested |
-| Qwen3.5-MoE | `qwen3_5_moe` | Yes (256 experts) | Tested (122B) |
+| Qwen3.5-MoE / Qwen3.6-35B-A3B | `qwen3_5_moe` | Yes (256 experts) | Tested (122B, 35B-A3B); 35B streams on a 16 GB Mac mini |
 | Nemotron-H (Mamba/attention hybrid) | `nemotron_h` | Yes (512 experts w/ latent MoE on Super-120B) | Tested (Nano-4B, Super-120B) — requires mlx-lm ≥ 0.31.3 |
 
 ## Project Structure
@@ -684,6 +728,11 @@ turboquant_mlx/
         polar_multi_gather_qmv.py  # Fused Metal kernel (MoE per-expert input)
     integration/
         rotation_configs.py   # Per-architecture rotation configs
+    stream/                   # Expert streaming — run MoE models beyond RAM (v0.4.0)
+        safetensors_reader.py # Per-expert disk slice reads (os.pread + F_NOCACHE)
+        streaming_switch.py   # StreamingSwitchLinear + byte-budgeted LRU ExpertCache
+        loader.py             # load_streaming(): swap experts to streaming after lazy load
+        stream_generate.py    # CLI: stream-generate (--cache-budget-gb)
 ```
 
 ## Citation
@@ -702,6 +751,6 @@ MIT
 
 ## Acknowledgments
 
-- [TurboQuant](https://arxiv.org/abs/2504.19874) — Zandieh, Han, Daliri, Karbasi (2025)
+- [TurboQuant](https://arxiv.org/abs/2504.19874) — Zandieh, Daliri, Hadian, Mirrokni (2025)
 - [MLX](https://github.com/ml-explore/mlx) — Apple Machine Learning Research
 - [mlx-lm](https://github.com/ml-explore/mlx-examples) — MLX language model utilities
