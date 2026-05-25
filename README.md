@@ -24,7 +24,7 @@ Supports dense models (LLaMA, Qwen, Mistral), **Mixture-of-Experts** (Qwen-MoE, 
 | **[GPT-OSS-120B (hybrid for 48GB)](https://huggingface.co/manjunathshiva/gpt-oss-120b-tq3a-tq2e-g32)** | **TQ 3-attn / 2-experts, gs=32** | **2/3 mix** | **—** | **~35 GB** | **42–50 tok/s** |
 | GPT-OSS-120B | TurboQuant | 2 | — | 32 GB | 51 tok/s (poor quality) |
 | Qwen3.5-122B-A10B | BF16 (original) | 16 | — | ~240 GB | *Doesn't fit 64GB* |
-| **Qwen3.5-122B-A10B** | **TurboQuant** | **3** | **—** | **~50 GB** | **26.5 tok/s** |
+| **Qwen3.5-122B-A10B** | **TurboQuant** | **3** | **—** | **~50 GB** | **26.5 tok/s (64 GB) · streams on a 16 GB Mac mini** |
 | **[Qwen3.6-35B-A3B](https://huggingface.co/manjunathshiva/Qwen3.6-35B-A3B-tq3-g32)** | **TurboQuant, gs=32** | **3** | **—** | **~16 GB** | **~60 tok/s (resident) · runs in <4 GB via streaming** |
 | **Nemotron-3-Nano-4B** | **TurboQuant** | **3** | **—** | **~2.2 GB** | **75.6 tok/s** |
 | Nemotron-3-Super-120B-A12B | BF16 (original) | 16 | — | ~240 GB | *Doesn't fit 64GB* |
@@ -514,6 +514,26 @@ turboquant-generate \\
 | **TurboQuant** | **3** | **~50 GB** | **54.9 GB** | **26.5 tok/s** | **Yes** | **Coherent reasoning with structured thinking** |
 
 > Qwen3.5-122B-A10B is the largest and most complex model TurboQuant has been tested on: 122B parameters, 256 experts (8 active per token), hybrid GatedDeltaNet + softmax attention, and a shared expert per MoE layer. At 3-bit, the model produces structured reasoning with proper analysis steps — demonstrating that TurboQuant preserves thinking capability at extreme compression.
+
+#### Run it on a 16 GB Mac mini (expert streaming)
+
+This 122B model — ~54 GB on disk — also runs on a **16 GB Mac mini** via expert streaming (the same mechanism as [Qwen3.6-35B-A3B](#qwen36-35b-a3b-on-a-16-gb-mac-mini-expert-streaming)). Only the router-selected experts are paged from disk per token (LRU-cached), so the resident footprint stays well under the machine's GPU wired-memory cap, and output is bit-identical to the fully-resident model. Requires `turboquant-mlx-full>=0.4.1`.
+
+```bash
+python -m turboquant_mlx.stream.stream_generate \
+    --model manjunathshiva/qwen3.5-122b-tq3 \
+    --prompt "Explain why the sky is blue." \
+    --max-tokens 128 --cache-budget-gb 4
+```
+
+Measured on a **base Apple M4 Mac mini, 16 GB**:
+
+| Cache budget | Expert hit-rate | Disk read / token | Decode | Peak (mlx) |
+|---|---|---|---|---|
+| `--cache-budget-gb 1` | 0% | ~1.78 GB | ~0.6 tok/s | 6.0 GB |
+| `--cache-budget-gb 4` *(recommended)* | **44.6%** | ~0.93 GB | **~1.1 tok/s** | 9.0 GB |
+
+On a 16 GB machine the binding limit is the **Metal GPU wired-memory cap (~10.5 GB)**, not total RAM — and the expert cache counts against it, so `mlx_peak ≈ 5 GB + cache_budget`. `--cache-budget-gb 4` is the sweet spot (~9 GB peak, safe margin); higher budgets risk a Metal out-of-memory error. Throughput is disk-bandwidth-bound (~10B active params/token) → ~1 tok/s on a single mini SSD. Slow, but **a 122B model running on a 16 GB Mac** is the result.
 
 ---
 
