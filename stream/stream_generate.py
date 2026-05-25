@@ -63,8 +63,10 @@ def main():
                         sampler=sampler, verbose=True)
     dt = time.time() - t
     print("=" * 60)
-    n = args.max_tokens
-    print(f"[stream] {n} tok in {dt:.1f}s = {n / dt:.1f} tok/s | "
+    # Count tokens actually generated (the model may stop at EOS before
+    # max_tokens) — dividing max_tokens by wall-time overstates the rate.
+    n = len(tok.encode(text))
+    print(f"[stream] {n} generated tok in {dt:.1f}s = {n / dt:.1f} tok/s (end-to-end) | "
           f"peak RSS={_rss_gb():.2f} GB | mlx_peak={mx.get_peak_memory() / 1e9:.2f} GB")
     s = cache.stats()
     print(f"[stream] expert cache: hit_rate={s['hit_rate']:.1%} resident={s['resident_gb']:.2f} GB "
