@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-05-25
+
+### Fixed
+
+- **Packaging: `turboquant_mlx.stream` was omitted from the 0.4.0
+  distribution.** The `[tool.setuptools] packages` list enumerates packages
+  explicitly and the new `stream` subpackage was not added, so 0.4.0 shipped
+  without the streaming code (`import turboquant_mlx.stream` failed after a
+  PyPI install; the feature was only reachable from a source checkout). Added
+  `turboquant_mlx.stream` to the packages list. Expert streaming now works
+  from `pip install turboquant-mlx-full`.
+
 ## [0.4.0] - 2026-05-25
 
 ### Added
