@@ -4,6 +4,36 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-25
+
+### Added
+
+- **Expert streaming for MoE models (`turboquant_mlx.stream`).** Run MoE
+  checkpoints whose weights exceed available RAM by paging only the
+  router-selected experts from disk per token (LRU-cached), keeping the full
+  `(num_experts, ...)` expert tensors out of memory. Output is bit-identical
+  to the fully-resident model. New CLI:
+  `python -m turboquant_mlx.stream.stream_generate --model <repo> --cache-budget-gb <GB>`.
+  - Validated on a 16 GB Mac mini running the ~16 GB
+    `Qwen3.6-35B-A3B-tq3-g32` (`qwen3_5_moe`, 256 experts): 3.9 GB peak RSS
+    at `--cache-budget-gb 2` (~3 tok/s) up to 9.4 GB / ~4.5 tok/s at
+    `--cache-budget-gb 8`. Disk read is the throughput limiter; a larger cache
+    budget raises the expert hit-rate and cuts per-token SSD traffic.
+  - Uses `os.pread` + macOS `F_NOCACHE` so streaming tens of GB of expert
+    slices doesn't balloon resident page cache; RSS tracks MLX managed memory.
+
+### Fixed
+
+- `stream_generate` reported throughput by dividing `--max-tokens` by
+  wall-time, overstating tok/s whenever the model stopped at EOS before the
+  cap. It now counts the tokens actually generated.
+
+### Notes
+
+- Streaming currently targets the `qwen3_5_moe` expert layout
+  (`language_model.model.layers[*].mlp.switch_mlp.{gate,up,down}_proj`);
+  generalizing to other MoE architectures is future work.
+
 ## [0.3.0] - 2026-05-03
 
 ### Changed
