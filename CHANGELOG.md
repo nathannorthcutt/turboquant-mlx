@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-05-26
+
+### Added
+
+- **Parallel expert prefetch for streaming MoE (`turboquant_mlx.stream`).**
+  The experts missing for a layer are now `pread` concurrently on a thread
+  pool instead of one at a time. Because `pread` is positional and releases
+  the GIL, the per-layer disk stall drops from the sum of the slice reads to
+  roughly the slowest one; MLX array construction and `eval` stay on the
+  calling thread, so output is **bit-identical** to the serial path. Controlled
+  by `--prefetch-workers` (default `8`; `1` restores the old serial behavior).
+  Measured on Qwen3.6-35B-A3B-tq3-g32 at a 1 GB cache budget: decode **3.2 →
+  6.0 tok/s (~1.9×)** and prefill **5.4 → 13.9 tok/s (~2.6×)**, same 3.48 GB
+  peak, identical generated text.
+
+### Notes
+
+- Frequency-based hot-expert *pinning* was prototyped alongside prefetch and
+  **rejected**: reserving budget for a frozen "hot" set consistently lowered
+  the cache hit rate versus a plain adaptive LRU in single-stream decode
+  (49.0% → 38.8% at the same 1 GB budget), because the tight-budget streaming
+  regime is exactly where starving the LRU hurts most. Not shipped.
+
 ## [0.4.1] - 2026-05-25
 
 ### Fixed

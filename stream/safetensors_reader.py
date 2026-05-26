@@ -98,11 +98,16 @@ class SafetensorsExpertReader:
         return self._index[key].shape[0]
 
     # -- the hot path --------------------------------------------------
-    def read_expert(self, key: str, expert: int) -> mx.array:
-        """Return slice ``[expert]`` of a stacked tensor as an mx.array.
+    def read_expert_np(self, key: str, expert: int):
+        """Return ``(numpy_array, mlx_dtype)`` for slice ``[expert]``.
 
-        For a tensor of shape (E, d0, d1, ...) this returns shape (d0, d1, ...)
-        and copies only that expert's bytes into an MLX buffer.
+        This is the disk half of :meth:`read_expert`: a positional ``os.pread``
+        (which releases the GIL and ignores the file offset, so it is safe to
+        call concurrently on the same fd) plus a zero-copy ``np.frombuffer``
+        view. The MLX array — which we keep on a single thread — is built by
+        the caller. Splitting it this way lets the expert cache fan the
+        per-layer ``pread``s across a thread pool without ever touching MLX
+        from a worker thread.
         """
         loc = self._index[key]
         np_dt, itemsize, mlx_dt = _DTYPES[loc.dtype]
@@ -114,8 +119,17 @@ class SafetensorsExpertReader:
         # pread on an F_NOCACHE fd: copies just this expert's bytes, without
         # growing the resident page cache.
         raw = os.pread(self._fds[loc.file_idx], nbytes, start)
-        buf = np.frombuffer(raw, dtype=np_dt, count=per_expert)
-        return mx.array(buf.reshape(loc.shape[1:]), dtype=mlx_dt)
+        buf = np.frombuffer(raw, dtype=np_dt, count=per_expert).reshape(loc.shape[1:])
+        return buf, mlx_dt
+
+    def read_expert(self, key: str, expert: int) -> mx.array:
+        """Return slice ``[expert]`` of a stacked tensor as an mx.array.
+
+        For a tensor of shape (E, d0, d1, ...) this returns shape (d0, d1, ...)
+        and copies only that expert's bytes into an MLX buffer.
+        """
+        buf, mlx_dt = self.read_expert_np(key, expert)
+        return mx.array(buf, dtype=mlx_dt)
 
     def close(self):
         for fd in self._fds:

@@ -21,15 +21,20 @@ from .streaming_switch import ExpertCache, StreamingSwitchLinear
 _PROJS = ("gate_proj", "up_proj", "down_proj")
 
 
-def load_streaming(model_path, cache_budget_gb: float = 3.0, fast: bool = False):
+def load_streaming(model_path, cache_budget_gb: float = 3.0, fast: bool = False,
+                   prefetch_workers: int = 8):
     """Returns (model, tokenizer, cache).
 
     cache_budget_gb bounds total resident expert memory (LRU-evicted).
+    prefetch_workers parallelizes per-layer expert reads (1 = serial baseline).
     """
     local_path = str(resolve_model_path(model_path))
     model, tok = load_turboquant(local_path, lazy=True, fast=fast)
     reader = SafetensorsExpertReader(local_path)
-    cache = ExpertCache(reader, int(cache_budget_gb * 1e9))
+    cache = ExpertCache(
+        reader, int(cache_budget_gb * 1e9),
+        prefetch_workers=prefetch_workers,
+    )
 
     layers = model.language_model.model.layers
     prefix = "language_model.model.layers"

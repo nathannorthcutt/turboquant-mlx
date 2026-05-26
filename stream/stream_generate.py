@@ -42,12 +42,17 @@ def main():
     p.add_argument("--temp", type=float, default=0.7)
     p.add_argument("--cache-budget-gb", type=float, default=3.0,
                    help="Max resident expert memory (LRU-evicted). Lower = less RAM, more disk reads.")
+    p.add_argument("--prefetch-workers", type=int, default=8,
+                   help="Threads for parallel per-layer expert reads. 1 = serial baseline.")
     p.add_argument("--fast", action="store_true", help="Disable QJL correction for faster decode.")
     p.add_argument("--no-chat-template", action="store_true")
     args = p.parse_args()
 
     t0 = time.time()
-    model, tok, cache = load_streaming(args.model, cache_budget_gb=args.cache_budget_gb, fast=args.fast)
+    model, tok, cache = load_streaming(
+        args.model, cache_budget_gb=args.cache_budget_gb, fast=args.fast,
+        prefetch_workers=args.prefetch_workers,
+    )
     print(f"[stream] loaded in {time.time() - t0:.1f}s | resident RSS={_rss_gb():.2f} GB")
 
     prompt = args.prompt
