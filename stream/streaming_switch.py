@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import mlx.core as mx
@@ -31,9 +32,16 @@ class ExpertCache:
     Shared across every streaming layer so a single byte budget bounds the
     total resident expert memory. Keyed by (weight_key, expert) which is
     globally unique (weight_key already encodes layer + projection).
+
+    The experts missing for a single ``gather`` are read in one batch and,
+    when ``prefetch_workers > 1``, their ``pread``s are fanned across a thread
+    pool. ``pread`` releases the GIL, so the per-layer disk stall drops from the
+    sum of the slice reads to roughly the slowest one. MLX array construction
+    and ``eval`` stay on the calling thread, so the produced tensors are
+    bit-identical to the serial path.
     """
 
-    def __init__(self, reader, budget_bytes: int):
+    def __init__(self, reader, budget_bytes: int, *, prefetch_workers: int = 8):
         self.reader = reader
         self.budget = budget_bytes
         self.cur = 0
@@ -42,39 +50,82 @@ class ExpertCache:
         self.hits = 0
         self.misses = 0
         self.bytes_read = 0
+        # parallel prefetch
+        self._workers = max(1, int(prefetch_workers))
+        self._pool = (ThreadPoolExecutor(max_workers=self._workers)
+                      if self._workers > 1 else None)
 
-    def _get_one(self, wkey: str, skey: str, e: int):
-        ck = (wkey, e)
-        hit = self._od.get(ck)
-        if hit is not None:
-            self._od.move_to_end(ck)
-            self.hits += 1
-            return hit[0], hit[1]
-        w = self.reader.read_expert(wkey, e)
-        s = self.reader.read_expert(skey, e)
-        mx.eval(w, s)  # force the slice copy out of mmap into an MLX buffer now
-        nb = w.nbytes + s.nbytes
-        self._od[ck] = (w, s, nb)
-        self.cur += nb
-        self.misses += 1
-        self.bytes_read += nb
-        self._evict()
-        return w, s
+    # -- loading -------------------------------------------------------
+    def _load_serial(self, miss_pairs):
+        out = {}
+        for wkey, skey, e in miss_pairs:
+            w = self.reader.read_expert(wkey, e)
+            s = self.reader.read_expert(skey, e)
+            mx.eval(w, s)  # force the slice copy out of mmap into an MLX buffer
+            out[(wkey, e)] = (w, s, w.nbytes + s.nbytes)
+        return out
+
+    def _load_parallel(self, miss_pairs):
+        # fan the (GIL-releasing) preads across the pool, then build + eval the
+        # MLX arrays on this thread so MLX is never touched from a worker.
+        tasks = []
+        for wkey, skey, e in miss_pairs:
+            tasks.append((wkey, e))
+            tasks.append((skey, e))
+        bufs = list(self._pool.map(lambda t: self.reader.read_expert_np(*t), tasks))
+        arrs = [mx.array(buf, dtype=dt) for (buf, dt) in bufs]
+        mx.eval(*arrs)
+        out = {}
+        for i, (wkey, _skey, e) in enumerate(miss_pairs):
+            w, s = arrs[2 * i], arrs[2 * i + 1]
+            out[(wkey, e)] = (w, s, w.nbytes + s.nbytes)
+        return out
 
     def _evict(self):
         while self.cur > self.budget and len(self._od) > 1:
-            _, (_w, _s, nb) = self._od.popitem(last=False)
+            _, (_w, _s, nb) = self._od.popitem(last=False)  # oldest
             self.cur -= nb
 
     def gather(self, wkey: str, skey: str, experts: list[int]):
         """Return stacked (n, out, packed) weight + (n, out, ng) scales for
         ``experts`` (in the given order)."""
+        # classify against the current resident set, then load all misses in
+        # one (optionally parallel) batch.
+        miss_pairs = []
+        for e in experts:
+            ck = (wkey, e)
+            if ck in self._od:
+                self.hits += 1
+            else:
+                self.misses += 1
+                miss_pairs.append((wkey, skey, e))
+
+        if miss_pairs:
+            loaded = (self._load_parallel(miss_pairs) if self._pool
+                      else self._load_serial(miss_pairs))
+            for ck, entry in loaded.items():
+                self._od[ck] = entry
+                self.cur += entry[2]
+                self.bytes_read += entry[2]
+
+        # Build the stack *before* evicting so freshly loaded slices are still
+        # present (and held by ``ws``/``ss``, so eviction can't free them out
+        # from under this call).
         ws, ss = [], []
         for e in experts:
-            w, s = self._get_one(wkey, skey, e)
+            ck = (wkey, e)
+            w, s, _ = self._od[ck]
+            self._od.move_to_end(ck)
             ws.append(w)
             ss.append(s)
+
+        self._evict()
         return mx.stack(ws, axis=0), mx.stack(ss, axis=0)
+
+    def close(self):
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
 
     def stats(self):
         tot = self.hits + self.misses
