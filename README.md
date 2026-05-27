@@ -64,7 +64,29 @@ First Metal4 / `MTLGPUFamilyApple10` data point, contributed by [@sbayer2](https
 | K8 / V3 + sink128 | **76.1** | 45.7 | 18.124 GB |
 | K3 / V3 | 75.6 | 45.2 | 18.122 GB |
 
-KV compression gives a consistent **~1.6× prompt-processing speedup** for a ~12% decode cost. Expert-streaming hit-rate scales with the cache budget — **44.6% at 4 GB (16 GB mini) → 89.9% at 30 GB (48 GB)**, a ~7× throughput jump that fills the gap between the 16 GB and 64 GB tiers.
+**122B expert streaming — parallel prefetch** (`--cache-budget-gb 30`, 256 tokens):
+
+| `--prefetch-workers` | Gen t/s | E2E t/s | Disk read | Hit rate |
+|----------------------|---------|---------|-----------|----------|
+| 1 (serial) | 7.4 | 5.7 | 44.3 GB | 89.5% |
+| **8 (parallel)** | **9.1** | **7.6** | 41.9 GB | 90.1% |
+| **Speedup** | **1.23×** | **1.33×** | | |
+
+A 1.23× decode speedup from `--prefetch-workers 8`, landing between the Mac mini (1.3×) and the M4 Max (1.67×). The M5 Pro MacBook Pro SSD is the limiter — parallel prefetch helps but doesn't saturate the way the M4 Max's higher-bandwidth SSD does.
+
+**122B expert streaming — cache-budget sweep** (`--prefetch-workers 8`, 256 tokens):
+
+| Budget | Hit rate | Gen t/s | E2E t/s | Peak Metal | Disk read |
+|--------|----------|---------|---------|------------|-----------|
+| 20 GB | 80.9% | 7.1 | 6.1 | 24.2 GB | 80.7 GB |
+| **30 GB** | **90.3%** | **9.1** | **7.6** | 34.2 GB | 40.9 GB |
+| 38 GB | 91.0% | 8.9 | 7.5 | 42.2 GB | 38.0 GB |
+
+The hit-rate curve flattens hard past 30 GB (only +0.7% for +8 GB), and throughput actually dips at 38 GB as peak Metal (42.2 GB) crowds the wired cap. **30 GB is the sweet spot on the 48 GB tier** — 90%+ hit rate with ~14 GB of headroom for OS stability; pushing to 38 GB gives negligible gain while peaking uncomfortably close to the wired limit.
+
+KV compression gives a consistent **~1.6× prompt-processing speedup** for a ~12% decode cost (long-context decode behavior is in [The speed flip](#the-speed-flip)). Expert-streaming hit-rate scales with the cache budget — **44.6% at 4 GB (16 GB mini) → 89.9% at 30 GB (48 GB)**, a ~7× throughput jump that fills the gap between the 16 GB and 64 GB tiers.
+
+> **Stability near the memory ceiling:** long-context *prompt prefill* close to the wired cap can starve the kernel watchdog (a `watchdogd` / `AppleARMWatchdogTimer` panic). A rapidly-growing KV cache makes Metal commit pages continuously (`AGXG17XFamilyResidencySet _commitAddedAllocations`), so the binding limit is allocation *rate*, not peak — a static 41 GB resident model (Nemotron) is stable, while a growing ~30 GB KV during a 63K-token prefill can panic. Practical limits on the 48 GB tier (#14): contexts up to ~14.5K are safe on the 35B with either KV config; 63K is feasible with K8/V3 (28.7 GB peak) but not fp16 (30.8 GB → panic). Keep headroom and close other apps for long-context runs near the cap.
 
 ## Install
 
@@ -361,12 +383,28 @@ turboquant-generate --model ./model-tq3 --prompt "..." \
 
 ### The speed flip
 
-On small fast models (~20B), KV cache compression is a quality-vs-speed tradeoff: the dequant overhead dominates because the model is fast to begin with. On large slow models (100B+), the 4x smaller KV cache reduces memory bandwidth more than dequant adds — generation is *faster* than the FP16 baseline:
+Whether KV compression speeds up or slows down decode depends on the **per-token KV cache size**, not the parameter count. When the per-token KV is large (many KV heads and/or long context), its 4x smaller footprint cuts memory bandwidth more than dequant adds, and decode is *faster* than FP16. When it is small (few active params, short context), dequant overhead dominates and compression is *slower* — a pure memory optimization.
 
 | Model | FP16 KV | TQ 3-bit KV | Direction |
 |-------|---------|-------------|-----------|
 | GPT-OSS-20B | 90.6 tok/s | 29.9 tok/s | TQ is 3x **slower** |
+| Qwen3.6-35B-A3B (3B active) | 52.0 tok/s | 45.7 tok/s | TQ is 1.1x **slower** |
 | GPT-OSS-120B | 6.4 tok/s | 8.7 tok/s | TQ is 1.4x **faster** |
+
+The penalty also **grows with context** on small-KV models. A community long-context benchmark on M5 Pro (#14) measured Qwen3.6-35B-A3B-tq3-g32 decode at four context lengths (256 gen tokens, except 63K which used 128):
+
+| Context | KV Config | Prompt t/s | Decode t/s | Peak Metal | Memory Saved |
+|---------|-----------|-----------|-----------|------------|--------------|
+| ~65 tok | fp16 | 47.8 | 52.0 | 18.13 GB | — |
+| ~65 tok | K8/V3 | 76.1 | 45.7 | 18.12 GB | 0.01 GB |
+| ~2.5K tok | fp16 | 131.9 | 51.5 | 20.50 GB | — |
+| ~2.5K tok | K8/V3 | 133.4 | 38.2 | 20.55 GB | -0.05 GB |
+| ~14.5K tok | fp16 | 132.8 | 46.0 | 22.50 GB | — |
+| ~14.5K tok | K8/V3 | 132.6 | 16.7 | 21.94 GB | 0.56 GB |
+| ~63K tok | fp16 | 124.5 | 34.5 | 30.79 GB | — |
+| ~63K tok | K8/V3 (no sink) | 123.6 | 5.2 | 28.71 GB | 2.08 GB |
+
+The fp16 decode advantage *widens* with context — 1.14× at 65 tokens → 1.35× at 2.5K → 2.75× at 14.5K → **6.6× at 63K**. So on small-active MoEs, use KV compression to *fit* longer contexts in less RAM (2.08 GB saved at 63K) — not to speed them up. The flip to *faster* shows up only on models with a large per-token KV such as the 120B (whose long-context crossover still needs a 64 GB+ machine to confirm).
 
 ### Compatibility
 
