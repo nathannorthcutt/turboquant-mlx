@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-28
+
 ### Added
 
 - **Memory-bounded (streaming) converter — `convert --streaming`.** The default
@@ -30,8 +32,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `language_model.model.layers` layout (qwen3_5_moe) and the text-only
   `model.model.layers` layout (DeepSeek).
 - **`qwen3_moe` rotation config registered** (standard attention + SwitchGLU, =
-  `MOE_LLAMA_CONFIG`). Enables Qwen3-MoE conversion (e.g. Qwen3-235B-A22B via
-  `--streaming`); untested pending a conversion.
+  `MOE_LLAMA_CONFIG`). Validated on Qwen3-235B-A22B-Instruct-2507: converted to
+  a hybrid **tq3a-tq2e g32** build (3-bit attention, 2-bit experts, full-precision
+  routers — 70.51 GB across 15 shards) on a 16 GB Mac mini via `--streaming`, and
+  generates coherent text through expert streaming. First `qwen3_moe` validation
+  and confirmation that 2-bit experts hold at Qwen3's 128-expert / top-8 routing.
 
 ## [0.5.0] - 2026-05-26
 
