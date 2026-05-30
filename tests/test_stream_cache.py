@@ -31,6 +31,15 @@ class FakeReader:
         self.read_calls += 1
         return self._content(key, expert)
 
+    def read_range_np(self, key: str, e_start: int, count: int):
+        # Coalesced read of `count` consecutive experts in one call — mirrors
+        # SafetensorsExpertReader.read_range_np: returns (count, *rest), dtype.
+        # Stacking _content keeps it byte-identical to the per-expert path.
+        self.read_calls += 1
+        rows = [self._content(key, e_start + i)[0] for i in range(count)]
+        _, mlx_dt = self._content(key, e_start)
+        return np.stack(rows), mlx_dt
+
     def read_expert(self, key: str, expert: int):
         buf, dt = self._content(key, expert)
         return mx.array(buf, dtype=dt)
@@ -70,3 +79,17 @@ def test_eviction_respects_budget():
         cache.gather("k.weight", "k.scales", [e])
     # never grows unbounded: resident bytes stay within ~one entry of budget.
     assert cache.cur <= 200 + 48
+
+
+def test_prefetch_staging_hit():
+    # A staged expert (weight+scales held under one key) is served from the
+    # staging area without a critical-path miss, and its content matches a
+    # direct read. Guards the single-key staging structure (no orphaned halves).
+    cache = ExpertCache(FakeReader(), budget_bytes=10**9,
+                        prefetch_workers=1, prefetch_ahead=1)
+    cache._prefetch_one("L0.gate.weight", "L0.gate.scales", 2)
+    assert ("L0.gate.weight", 2) in cache._staging  # one entry, not two
+    w, _ = cache.gather("L0.gate.weight", "L0.gate.scales", [2])
+    assert cache.prefetch_hits == 1 and cache.misses == 0
+    assert int(np.array(w)[0][0]) == 20  # expert 2 -> 2*10 at column 0
+    assert cache._staging_bytes == 0  # claimed, not orphaned
