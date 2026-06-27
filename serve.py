@@ -49,6 +49,28 @@ Usage:
     # Stream a 122B on a 16 GB mini (+ KV-quant for long agentic context):
     turboquant-serve --model manjunathshiva/qwen3.5-122b-tq3 \
         --cache-budget-gb 4 --kv-k-bits 8 --kv-v-bits 3 --prompt-concurrency 1
+    # Diagnostic: measure redundant prefill of an agentic client (Claude
+    # Code / Aider) — per-request + exit summary, hardware-invariant:
+    turboquant-serve --model <tq-path> --prompt-concurrency 1 \
+        --prefill-stats --prefill-stats-file prefill.jsonl
+    # Survive a multi-minute cold prefill behind claude-code-router (Claude
+    # Code) — mirror prefill keepalives as real SSE data chunks:
+    turboquant-serve --model manjunathshiva/qwen3.5-122b-tq3 \
+        --cache-budget-gb 4 --prefill-keepalive --prompt-concurrency 1
+
+Prefill keepalive (long cold prefills behind a proxy)
+-----------------------------------------------------
+A streaming agentic client (Claude Code via claude-code-router) aborts a
+request whose connection sends no bytes for ~1 min and then retries — so a
+multi-minute *cold prefill* (e.g. a 22K-token prompt on a streaming 122B over
+a slow disk) never completes: each retry restarts the prefill from scratch.
+``mlx_lm.server`` already emits keepalives during prompt processing, but as SSE
+*comment* lines (``: keepalive p/t``), which a proxy parsing the SSE stream
+drops before they reach the client. ``--prefill-keepalive`` mirrors each of
+those (throttled by ``--prefill-keepalive-interval``, default 10s) as a real
+``data:`` chunk (an empty assistant delta — no visible content), which proxies
+forward and clients count as stream activity, so the client rides out the
+prefill instead of timing out.
 
 All other flags forward to `mlx_lm.server`; see `--help`.
 """
@@ -56,7 +78,9 @@ All other flags forward to `mlx_lm.server`; see `--help`.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 
 _MIN_MLX_LM = (0, 31, 3)
 
@@ -247,6 +271,51 @@ def _extract_stream_args(argv):
     return stream_config, remaining
 
 
+def _extract_prefill_stats_args(argv):
+    """Peel the prefill-redundancy diagnostic flags off ``argv``.
+
+    ``--prefill-stats`` (or just giving ``--prefill-stats-file``) turns on
+    per-request logging of how much of each prompt is reused vs. re-prefilled,
+    plus an exit summary of how much fresh prefill a working prefix cache would
+    recover. Diagnostic only; no effect on generation.
+
+    Returns ``(stats_config | None, remaining_argv)``.
+    """
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--prefill-stats", dest="prefill_stats",
+                        action="store_true", default=False)
+    parser.add_argument("--prefill-stats-file", dest="prefill_stats_file",
+                        default=None)
+    ns, remaining = parser.parse_known_args(argv)
+
+    if not ns.prefill_stats and ns.prefill_stats_file is None:
+        return None, remaining
+
+    return dict(stats_file=ns.prefill_stats_file), remaining
+
+
+def _extract_prefill_keepalive_args(argv):
+    """Peel the prefill-keepalive flags off ``argv``.
+
+    ``--prefill-keepalive`` mirrors mlx_lm's prefill keepalive comments as real
+    SSE ``data:`` chunks so a proxy that drops comments (claude-code-router)
+    keeps an agentic client (Claude Code) alive through a multi-minute cold
+    prefill instead of timing out. ``--prefill-keepalive-interval`` throttles
+    them (seconds; default 10). Returns ``(config | None, remaining_argv)``.
+    """
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--prefill-keepalive", dest="prefill_keepalive",
+                        action="store_true", default=False)
+    parser.add_argument("--prefill-keepalive-interval", dest="interval",
+                        type=float, default=10.0)
+    ns, remaining = parser.parse_known_args(argv)
+
+    if not ns.prefill_keepalive:
+        return None, remaining
+
+    return dict(interval=ns.interval), remaining
+
+
 def _patch_kv_cache(kv_config) -> None:
     """Wrap `mlx_lm.server.make_prompt_cache` to emit TurboQuant KV caches.
 
@@ -271,14 +340,96 @@ def _patch_kv_cache(kv_config) -> None:
     _server_mod.make_prompt_cache = _tq_make_prompt_cache
 
 
+class _KeepaliveSSEWriter:
+    """Wrap an SSE ``wfile`` to mirror mlx_lm's prefill keepalives as data chunks.
+
+    During a long prompt prefill ``mlx_lm.server`` writes SSE *comment* lines
+    (``: keepalive p/t``) to keep the socket warm. Comments keep a *direct*
+    client alive, but a proxy that parses the SSE stream (claude-code-router)
+    drops comment lines — so a downstream agentic client sees a byte-less
+    connection through a multi-minute cold prefill and aborts. This writer
+    passes every byte through unchanged, and additionally mirrors each
+    ``: keepalive`` comment (throttled to ``interval`` seconds) as a real
+    ``data:`` chunk built by ``make_chunk`` — which proxies forward and clients
+    count as activity. The chunk is an empty assistant delta, so no visible
+    content is added.
+    """
+
+    def __init__(self, wfile, make_chunk, interval, clock=time.monotonic):
+        self._wfile = wfile
+        self._make_chunk = make_chunk
+        self._interval = interval
+        self._clock = clock
+        self._last = 0.0
+
+    def write(self, b):
+        n = self._wfile.write(b)
+        raw = bytes(b) if isinstance(b, (bytes, bytearray)) else b
+        if isinstance(raw, bytes) and raw.startswith(b": keepalive"):
+            now = self._clock()
+            if now - self._last >= self._interval:
+                self._last = now
+                try:
+                    chunk = self._make_chunk()
+                    self._wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    self._wfile.flush()
+                except Exception:
+                    pass  # keepalive is best-effort; never break the response
+        return n
+
+    def flush(self):
+        return self._wfile.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._wfile, name)
+
+
+def _patch_prefill_keepalive(interval: float = 10.0) -> None:
+    """Mirror mlx_lm's prefill keepalive *comments* as real SSE ``data:`` chunks.
+
+    Patches ``APIHandler.handle_completion`` to wrap ``self.wfile`` in a
+    ``_KeepaliveSSEWriter`` for the duration of a streaming request, so a proxy
+    that drops SSE comments (and the agentic client behind it) still sees stream
+    activity during a multi-minute cold prefill. No-op for non-streaming
+    requests. Reuses mlx_lm's existing per-prefill-step callback for timing.
+    """
+    import mlx_lm.server as _server_mod
+
+    APIHandler = _server_mod.APIHandler
+    _orig = APIHandler.handle_completion
+
+    def _handle_completion(self, request, stop_words):
+        if not getattr(self, "stream", False):
+            return _orig(self, request, stop_words)
+        real_wfile = self.wfile
+        self.wfile = _KeepaliveSSEWriter(
+            real_wfile,
+            make_chunk=lambda: self.generate_response("", None),
+            interval=interval,
+        )
+        try:
+            return _orig(self, request, stop_words)
+        finally:
+            self.wfile = real_wfile
+
+    APIHandler.handle_completion = _handle_completion
+
+
 def main() -> None:
     _check_mlx_lm_version()
 
     kv_config, remaining = _extract_kv_args(sys.argv[1:])
     stream_config, remaining = _extract_stream_args(remaining)
+    prefill_stats_config, remaining = _extract_prefill_stats_args(remaining)
+    prefill_keepalive_config, remaining = _extract_prefill_keepalive_args(remaining)
     _patch_loader(stream_config)
     if kv_config is not None:
         _patch_kv_cache(kv_config)
+    if prefill_stats_config is not None:
+        from turboquant_mlx.prefill_stats import install as _install_prefill_stats
+        _install_prefill_stats(**prefill_stats_config)
+    if prefill_keepalive_config is not None:
+        _patch_prefill_keepalive(**prefill_keepalive_config)
     # Hand mlx_lm.server only the args it understands.
     sys.argv = [sys.argv[0], *remaining]
 
@@ -307,6 +458,22 @@ def main() -> None:
             f"group={kv_config['group_size']}, "
             f"sink={kv_config['min_tokens_before_quant']} "
             "(forces single-stream serving)\n"
+        )
+    if prefill_stats_config is not None:
+        dest = prefill_stats_config["stats_file"] or "stderr only"
+        sys.stderr.write(
+            f"[turboquant-serve] Prefill-redundancy stats: ON "
+            f"(per-request + exit summary; jsonl -> {dest}). "
+            "Pair with --prompt-concurrency 1 for clean single-conversation "
+            "numbers.\n"
+        )
+    if prefill_keepalive_config is not None:
+        sys.stderr.write(
+            f"[turboquant-serve] Prefill keepalive: ON (mirror prefill "
+            f"keepalives as real SSE data chunks, throttled to "
+            f"{prefill_keepalive_config['interval']:.0f}s) — keeps Claude Code "
+            "and SSE-comment-dropping proxies alive through a long cold "
+            "prefill.\n"
         )
     _mlx_lm_server_main()
 
