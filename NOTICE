@@ -19,10 +19,9 @@ limitations under the License.
 
 This software implements the TurboQuant algorithm described in:
 
-  Zandieh, A., Han, M., Dalca, A., Shin, J., Wang, B., Zhang, Y.,
-  Bordegoni, M., Tian, Y., et al. (2025).
-  "TurboQuant: Online Vector Quantization with Optimal Distortion-Rate
-  Trade-off."
+  Zandieh, A., Daliri, M., Hadian, M., Mirrokni, V. (2025).
+  "TurboQuant: Online Vector Quantization with Near-optimal
+  Distortion Rate."
   https://arxiv.org/abs/2504.19874
 
 The original TurboQuant algorithm is research published by the authors
