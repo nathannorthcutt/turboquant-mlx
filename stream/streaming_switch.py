@@ -366,6 +366,7 @@ class StreamingSwitchLinear(nn.Module):
         cache: ExpertCache,
         layer_idx: int = -1,
         is_trigger: bool = False,
+        trit: bool = False,
     ):
         super().__init__()
         self.input_dims = input_dims
@@ -373,6 +374,21 @@ class StreamingSwitchLinear(nn.Module):
         self.num_experts = num_experts
         self.bits = bits
         self.group_size = group_size
+        # Ternary (1.58-bit) experts pack 20 base-3 trits per uint32 instead of
+        # bit-packing; the kernels and dequant switch to base-3 decode off this.
+        # Detect from the 3-entry codebook if the caller didn't say (self-describing).
+        self.trit = bool(trit) or codebook.size == 3
+        if self.trit:
+            # The Metal kernels hardcode n_codes=3 under trit; a mismatched
+            # codebook would read out of bounds on the GPU. Fail loud instead.
+            if codebook.size != 3:
+                raise ValueError(
+                    "Ternary (trit) mode requires a 3-entry codebook, "
+                    f"got size {codebook.size}."
+                )
+            # Match the resident layer (ternary is always bit-width 2) so the
+            # (bits, group_size, trit) kernel-cache key stays consistent.
+            self.bits = 2
         self._needs_rotation = needs_rotation
         # small resident tensors
         self.codebook = codebook
@@ -393,12 +409,15 @@ class StreamingSwitchLinear(nn.Module):
         Mirrors PolarQuantizedSwitchLinear._dequantize_all but on an
         (n_sel, out, packed) stack instead of all num_experts.
         """
-        from turboquant_mlx.core.packing import unpack_indices
+        from turboquant_mlx.core.packing import unpack_indices, unpack_trits
         from turboquant_mlx.core.codebook import dequantize_scalar
 
         n_sel = w_sel.shape[0]
         n_groups = self.input_dims // self.group_size
-        idx = unpack_indices(w_sel, self.bits, self.input_dims)
+        if self.trit:
+            idx = unpack_trits(w_sel, self.input_dims)
+        else:
+            idx = unpack_indices(w_sel, self.bits, self.input_dims)
         w_deq = dequantize_scalar(idx, self.codebook)
         w_deq = w_deq.reshape(n_sel, self.output_dims, n_groups, self.group_size)
         w_deq = w_deq * mx.expand_dims(s_sel, axis=-1)
@@ -433,6 +452,7 @@ class StreamingSwitchLinear(nn.Module):
             y = polar_gather_qmv(
                 w_sel, s_sel, self.codebook,
                 x_flat, idx_local_flat, self.bits, self.group_size,
+                trit=self.trit,
             )
             return y.reshape(list(indices.shape) + [1, self.output_dims])
 
@@ -441,6 +461,7 @@ class StreamingSwitchLinear(nn.Module):
             y = polar_multi_gather_qmv(
                 w_sel, s_sel, self.codebook,
                 x_2d, idx_local_flat, self.bits, self.group_size,
+                trit=self.trit,
             )
             return y.reshape(list(indices.shape) + [1, self.output_dims])
 
