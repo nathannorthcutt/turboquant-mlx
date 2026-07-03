@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import glob
+import json
 import sys
 from pathlib import Path
 
@@ -222,6 +223,19 @@ def main():
         help="Sampling temperature (default: 0.7)",
     )
     parser.add_argument(
+        "--top-p", type=float, default=None,
+        help="Nucleus sampling threshold. Defaults to the model's "
+             "generation_config.json value when present, else disabled. "
+             "Pass 0 to force-disable.",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=None,
+        help="Top-k truncation. Defaults to the model's "
+             "generation_config.json value when present, else disabled. "
+             "Pass 0 to force-disable. Without truncation, rare tokens like "
+             "a stray '</think>' can be sampled in place of EOS.",
+    )
+    parser.add_argument(
         "--rep-penalty", type=float, default=None,
         help="Repetition penalty (e.g. 1.04). Disabled when omitted. "
              "Recommended for hybrid Nemotron-3 to avoid long-gen tail "
@@ -299,7 +313,34 @@ def main():
         make_min_tokens_logits_processor,
     )
 
-    sampler = make_sampler(temp=args.temp)
+    # Truncation defaults come from the model's own generation_config.json
+    # (e.g. Qwen ships top_k=20/top_p=0.95). Untruncated temperature sampling
+    # over a 250K vocab occasionally picks a stray special token — seen as a
+    # doubled answer when '</think>' is sampled where '<|im_end|>' belongs.
+    top_p, top_k = args.top_p, args.top_k
+    if top_p is None or top_k is None:
+        # load_turboquant already resolved/downloaded the model, so this is a
+        # cache hit; read the json directly rather than pulling in transformers
+        # (only an optional [eval] dependency).
+        try:
+            gen_cfg_file = resolve_model_path(args.model) / "generation_config.json"
+            if gen_cfg_file.exists():
+                with open(gen_cfg_file, encoding="utf-8") as f:
+                    gen_cfg = json.load(f)
+                if top_p is None:
+                    top_p = gen_cfg.get("top_p")
+                if top_k is None:
+                    top_k = gen_cfg.get("top_k")
+        except Exception as e:
+            print(
+                f"[INFO] Could not read generation_config.json for "
+                f"{args.model}; sampling without truncation defaults ({e})"
+            )
+    sampler = make_sampler(
+        temp=args.temp,
+        top_p=top_p if top_p is not None else 0.0,
+        top_k=top_k if top_k is not None else 0,
+    )
     min_tokens_proc = make_min_tokens_logits_processor(
         args.min_tokens, eos_token_ids(tokenizer)
     )
