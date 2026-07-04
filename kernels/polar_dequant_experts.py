@@ -22,12 +22,30 @@ def _get_kernel(bits: int, group_size: int, trit: bool = False):
 
     if trit:
         n_codes = 3
-        pow3_init = ", ".join(f"{3 ** i}u" for i in range(20))
-        pow3_decl = f"    const uint pw3[20] = {{{pow3_init}}};\n"
-        # base-3 digit at position (col % 20): (word / 3**slot) % 3
+        # Metal (Apple GPU) has no fast integer divide, so a runtime-indexed
+        # powers-of-three lookup — (word / pw3[col % 20]) — emits a real
+        # hardware divide per weight element. Decode a packed word's 20 trits
+        # ONCE into a register array by dividing by the compile-time constant
+        # 3 (lowers to multiply-by-magic), then index it. trit_cache[i] ==
+        # (word / 3**i) % 3, so the code is bit-identical to the old lookup.
+        # Cached across the group's element loop; re-decoded only when the
+        # packed column changes.
+        pow3_decl = (
+            "    uint trit_cache[20];\n"
+            "    uint trit_word = 0xFFFFFFFFu;  // packed_col held in trit_cache\n"
+        )
         decode = """
-        uint word = packed_weight[pw_base + col / 20u];
-        uint code = (word / pw3[col % 20u]) % 3u;"""
+        uint packed_col = col / 20u;
+        if (packed_col != trit_word) {
+            uint w = packed_weight[pw_base + packed_col];
+            #pragma unroll
+            for (uint _t = 0; _t < 20u; _t++) {
+                trit_cache[_t] = w % 3u;
+                w /= 3u;
+            }
+            trit_word = packed_col;
+        }
+        uint code = trit_cache[col % 20u];"""
     else:
         n_codes = 1 << bits
         elems_per_u32 = 32 // bits

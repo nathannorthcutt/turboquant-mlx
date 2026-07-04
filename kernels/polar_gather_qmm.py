@@ -30,14 +30,21 @@ def _build_source(bits: int, group_size: int, trit: bool = False) -> str:
     if trit:
         n_codes = 3
         epu = 20              # trits per packed word
-        pow3_init = ", ".join(f"{3 ** i}u" for i in range(20))
-        pow3_decl = f"    const uint pw3[20] = {{{pow3_init}}};\n"
-        code_expr = "(word / pw3[j]) % 3u"   # base-3 digit at slot j
+        pow3_decl = ""
+        # Metal has no fast integer divide, so (word / pw3[j]) was a real
+        # hardware divide per weight. The j loop already walks trit slots
+        # 0,1,...,19 in order, so we decode sequentially: each step takes the
+        # low trit (mod by the constant 3) and shifts the word down (div by
+        # the constant 3 -> multiply-by-magic). w starts at `word`, so at
+        # slot j, `w % 3u == (word / 3**j) % 3u` — bit-identical output.
+        word_init = "uint tw = word;"
+        code_expr = "tw % 3u; tw /= 3u"
     else:
         n_codes = 1 << bits
         epu = 32 // bits          # codes per packed word
         mask = (1 << bits) - 1
         pow3_decl = ""
+        word_init = ""
         code_expr = f"(word >> (j * {bits}u)) & {mask}u"
     kc = WC * epu             # cols per chunk
 
@@ -106,6 +113,7 @@ def _build_source(bits: int, group_size: int, trit: bool = False) -> str:
         for (uint wi = wpart; wi < n_words; wi += 4u) {{
             uint word = packed_weight[pw_base + w0 + wi];
             uint col0 = wi * {epu}u;               // within chunk
+            {word_init}
             #pragma unroll
             for (uint j = 0; j < {epu}u; j++) {{
                 uint col = col0 + j;

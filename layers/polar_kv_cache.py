@@ -67,7 +67,15 @@ class TurboQuantKVCache:
         Number of leading tokens kept in fp16 (Tier A) before
         TQ-compressed storage (Tier B) takes over. Protects attention
         sinks at the cost of a fixed fp16 buffer. 0 disables the tier
-        and is byte-equivalent to v0.1.x. Recommended: 1024.
+        and is byte-equivalent to v0.1.x.
+
+        Default raised to 1024 (§5.3): keeping the first 1024 tokens in
+        fp16 shrinks the Tier-B volume that must be dequantized for
+        attention, which reduces both total dequant work and the size of
+        the fp16 fetch buffer. Tradeoff: a fixed
+        ``1024 * n_kv_heads * head_dim * 2`` bytes of pageable fp16 per
+        K and V lane that is always resident, even for short contexts.
+        Pass 0 to restore the v0.1.x byte-for-byte behaviour.
 
     Storage compression vs float16 (head_dim=128, group_size=64,
     accounting for fp16 group RMS scales):
@@ -89,7 +97,10 @@ class TurboQuantKVCache:
         *,
         k_bits: int | None = None,
         v_bits: int | None = None,
-        min_tokens_before_quant: int = 0,
+        # §5.3: default raised 0 -> 1024. Keeping the recent/leading window
+        # in fp16 reduces the Tier-B volume that has to be dequantized for
+        # attention. Costs a fixed fp16 buffer; pass 0 for v0.1.x parity.
+        min_tokens_before_quant: int = 1024,
     ):
         if tq_bits is not None and (k_bits is not None or v_bits is not None):
             raise ValueError(
@@ -117,6 +128,12 @@ class TurboQuantKVCache:
         self._v_bits = int(v_bits)
         self._group_size = int(group_size)
         self._seed = int(seed)
+
+        # Incremental Tier-B dequant cache (§5.3). Rolling fp16 buffer of the
+        # Tier-B tokens already dequantized, so each decode step decodes only
+        # the newly compressed delta instead of the whole history. See
+        # ``_reset_dequant_cache`` and the fetch path in ``update_and_fetch``.
+        self._reset_dequant_cache()
 
         # Precompute K codebook
         self._k_codebook_f32, self._k_boundaries_f32 = get_codebook(
@@ -225,6 +242,34 @@ class TurboQuantKVCache:
             v_deq.astype(mx.float32), signs.astype(mx.float32), block_size
         )
         return v_deq.astype(mx.float16)
+
+    def _reset_dequant_cache(self):
+        """Invalidate the incremental Tier-B fp16 dequant buffer.
+
+        Called on construction and whenever the compressed store is replaced
+        wholesale (``state`` setter) so the rolling buffer can never present
+        stale tokens against a freshly loaded Tier-B history.
+        """
+        # fp16 K/V for every Tier-B token already dequantized, grown in place.
+        self._tier_b_k_fp16 = None
+        self._tier_b_v_fp16 = None
+        # How many Tier-B tokens are currently valid in the buffers above.
+        self._tier_b_len = 0
+
+    def _grow_fp16_buffer(self, buf, valid_len, B, n_kv_heads, new_cap,
+                          head_dim):
+        """Return a larger fp16 Tier-B buffer, preserving decoded tokens.
+
+        Capacity is extended in ``self.step`` chunks (like the compressed
+        store), so the amortized copy cost is O(1) per token rather than the
+        O(N) that a per-step ``concatenate`` append would pay.
+        """
+        new_buf = mx.zeros(
+            (B, n_kv_heads, new_cap, head_dim), dtype=mx.float16
+        )
+        if buf is not None and valid_len > 0:
+            new_buf[..., :valid_len, :] = buf[..., :valid_len, :]
+        return new_buf
 
     def update_and_fetch(self, keys, values):
         """Store new KV across two tiers, return float16 for SDPA.
@@ -342,21 +387,68 @@ class TurboQuantKVCache:
 
         self.offset = new_offset
 
-        # Fetch: concat Tier A (fp16) + Tier B (dequantized)
+        # Fetch: concat Tier A (fp16) + Tier B (dequantized).
+        #
+        # Incremental dequant (§5.3). Naively this dequantized the entire
+        # Tier-B history every step — O(context) bandwidth per step and a
+        # large transient fp16 allocation that competes with expert streaming
+        # for DRAM, O(N^2) over a full decode. Instead we keep a rolling fp16
+        # buffer of the Tier-B tokens already dequantized and only decode the
+        # *delta*: the tokens that just moved from Tier A to Tier B this step.
+        # Tier B is append-only and its positions are stable (index i always
+        # maps to the same source token, even across compressed-store growth),
+        # so previously decoded tokens never need re-decoding. The buffer
+        # lives in pageable unified RAM (plain fp16, not wired) and grows O(N)
+        # in total, not O(N) per step.
         b_total = max(0, new_offset - threshold)
+
+        # A shrink (e.g. after trim()) invalidates the tail of the buffer;
+        # clamp so the delta below re-decodes any positions that were dropped
+        # and are later overwritten by fresh tokens.
+        if self._tier_b_len > b_total:
+            self._tier_b_len = b_total
+
         if b_total > 0:
-            k_deq_b = self._tq_dequantize(
-                self._tq_keys[0][..., :b_total, :],
-                self._tq_keys[1][..., :b_total, :],
-                self._k_signs, self._k_block_size, self._k_gs, k_head_dim,
-                self._k_bits, self._k_codebook_f16,
-            )
-            v_deq_b = self._tq_dequantize(
-                self._tq_values[0][..., :b_total, :],
-                self._tq_values[1][..., :b_total, :],
-                self._v_signs, self._v_block_size, self._v_gs, v_head_dim,
-                self._v_bits, self._v_codebook_f16,
-            )
+            new_b_tokens = b_total - self._tier_b_len
+            if new_b_tokens > 0:
+                start = self._tier_b_len
+                # Dequantize ONLY the newly compressed positions.
+                k_delta = self._tq_dequantize(
+                    self._tq_keys[0][..., start:b_total, :],
+                    self._tq_keys[1][..., start:b_total, :],
+                    self._k_signs, self._k_block_size, self._k_gs, k_head_dim,
+                    self._k_bits, self._k_codebook_f16,
+                )
+                v_delta = self._tq_dequantize(
+                    self._tq_values[0][..., start:b_total, :],
+                    self._tq_values[1][..., start:b_total, :],
+                    self._v_signs, self._v_block_size, self._v_gs, v_head_dim,
+                    self._v_bits, self._v_codebook_f16,
+                )
+
+                # Ensure capacity (grow in self.step chunks), append delta.
+                cap = (
+                    0 if self._tier_b_k_fp16 is None
+                    else self._tier_b_k_fp16.shape[-2]
+                )
+                if b_total > cap:
+                    new_cap = (
+                        (b_total + self.step - 1) // self.step * self.step
+                    )
+                    self._tier_b_k_fp16 = self._grow_fp16_buffer(
+                        self._tier_b_k_fp16, self._tier_b_len,
+                        B, n_kv_heads, new_cap, k_head_dim,
+                    )
+                    self._tier_b_v_fp16 = self._grow_fp16_buffer(
+                        self._tier_b_v_fp16, self._tier_b_len,
+                        B, n_kv_heads, new_cap, v_head_dim,
+                    )
+                self._tier_b_k_fp16[..., start:b_total, :] = k_delta
+                self._tier_b_v_fp16[..., start:b_total, :] = v_delta
+                self._tier_b_len = b_total
+
+            k_deq_b = self._tier_b_k_fp16[..., :b_total, :]
+            v_deq_b = self._tier_b_v_fp16[..., :b_total, :]
         else:
             k_deq_b = None
             v_deq_b = None
@@ -406,6 +498,10 @@ class TurboQuantKVCache:
     def state(self, v):
         if not v:
             return
+        # The compressed store is being replaced wholesale — the incremental
+        # Tier-B fp16 buffer no longer corresponds to it, so invalidate it and
+        # let the next update_and_fetch rebuild lazily from the delta.
+        self._reset_dequant_cache()
         # 2-tuple legacy form: (tq_keys, tq_values)
         if len(v) == 2:
             self._tq_keys, self._tq_values = v
@@ -511,13 +607,14 @@ def make_turboquant_cache(
     *,
     k_bits: int | None = None,
     v_bits: int | None = None,
-    min_tokens_before_quant: int = 0,
+    min_tokens_before_quant: int = 1024,
 ):
     """Create TurboQuant KV caches for all layers.
 
     Pass ``tq_bits`` for symmetric K/V (legacy) or ``(k_bits, v_bits)`` for
     mixed precision. ``min_tokens_before_quant`` keeps the first N tokens
-    in fp16 (recommended: 1024) to protect attention sinks. See
+    in fp16 (default 1024, §5.3) to protect attention sinks and shrink the
+    Tier-B dequant volume. Pass 0 for v0.1.x byte parity. See
     ``TurboQuantKVCache`` for details.
     """
     num_layers = len(model.layers)
@@ -539,7 +636,7 @@ def convert_cache_to_turboquant(
     *,
     k_bits: int | None = None,
     v_bits: int | None = None,
-    min_tokens_before_quant: int = 0,
+    min_tokens_before_quant: int = 1024,
 ):
     """Convert KVCache entries in a prompt cache list to TurboQuantKVCache.
 

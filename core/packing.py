@@ -101,12 +101,9 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
     # Reshape to (..., n_packed, elems_per_u32) for vectorized packing
     indices = indices.reshape(*batch_shape, n_packed, elems_per_u32)
 
-    # Pack: shift each element by (index_within_group * bits) and OR together
-    packed = mx.zeros((*batch_shape, n_packed), dtype=mx.uint32)
-    for i in range(elems_per_u32):
-        packed = packed | (indices[..., i] << (i * bits))
-
-    return packed
+    # Pack: identical to pack_trits — multiply by place-values then sum.
+    shifts = mx.array([i * bits for i in range(elems_per_u32)], dtype=mx.uint32)
+    return mx.sum(indices << shifts, axis=-1)
 
 
 def unpack_indices(packed: mx.array, bits: int, count: int) -> mx.array:
