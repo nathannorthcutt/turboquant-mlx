@@ -41,7 +41,7 @@ from datetime import datetime
 # constants
 # --------------------------------------------------------------------------
 DEFAULT_ROOT = os.path.expanduser("~/.turboquant_mlx")
-DEFAULT_MODEL = "manjunathshiva/Qwen3-235B-A22B-tq3-g32"
+DEFAULT_MODEL = "manjunathshiva/Qwen3-235B-A22B-Instruct-2507-tq3a-tq2e-g32"
 
 # setup / run defaults (also documented in each subcommand's --help)
 DEF_MAX_TOKENS = 512
@@ -91,7 +91,7 @@ def _done(msg: str) -> None:
 # path / slug helpers
 # --------------------------------------------------------------------------
 def slugify(model_id: str) -> str:
-    """``manjunathshiva/Qwen3-235B-A22B-tq3-g32`` -> ``manjunathshiva-qwen3-235b-a22b-tq3-g32``.
+    """``manjunathshiva/Qwen3-235B-A22B-Instruct-2507-tq3a-tq2e-g32`` -> ``manjunathshiva-qwen3-235b-a22b-instruct-2507-tq3a-tq2e-g32``.
 
     ``/`` becomes ``-``; ``_`` is preserved; everything is lowercased.
     """
