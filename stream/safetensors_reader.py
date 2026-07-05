@@ -44,10 +44,14 @@ def _layer_from_key(key: str) -> int | None:
 _F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
 
 # safetensors dtype string -> (numpy dtype, itemsize, mlx dtype)
+# BF16 is stored as uint16 in numpy (same 16-bit representation); callers that
+# build an mx.array from it must use .view(mx.bfloat16) to reinterpret the
+# bits correctly rather than mx.array(arr, dtype=mx.bfloat16) which converts.
 _DTYPES = {
     "U32": (np.uint32, 4, mx.uint32),
     "F16": (np.float16, 2, mx.float16),
     "F32": (np.float32, 4, mx.float32),
+    "BF16": (np.uint16, 2, mx.bfloat16),
 }
 
 

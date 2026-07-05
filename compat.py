@@ -145,10 +145,18 @@ def _patch_moe_layer_barrier():
                 mask = create_attention_mask(h, cache[0])
 
                 if _diag:
-                    mx.eval(h, mask)
+                    if mask is not None:
+                        mx.eval(h, mask)
+                    else:
+                        mx.eval(h)
+                    _mask_repr = (
+                        None if mask is None
+                        else list(mask.shape) if hasattr(mask, 'shape')
+                        else type(mask).__name__
+                    )
                     print(
                         f"[tq-diag] barrier-loop active  layers={len(self.layers)}"
-                        f"  h={list(h.shape)}  mask={'None' if mask is None else list(mask.shape)}"
+                        f"  h={list(h.shape)}  mask={_mask_repr}"
                         f"  active={mx.get_active_memory()//1048576} MB"
                         f"  peak={mx.get_peak_memory()//1048576} MB",
                         flush=True,

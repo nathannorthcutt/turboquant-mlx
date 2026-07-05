@@ -15,12 +15,61 @@ import os
 import time
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from turboquant_mlx.generate import load_turboquant, resolve_model_path
 from turboquant_mlx.layers.polar_switch_linear import PolarQuantizedSwitchLinear
 
 from .safetensors_reader import SafetensorsExpertReader
 from .streaming_switch import ExpertCache, StreamingSwitchLinear
+
+
+class _BF16StreamingSwitchLinear(nn.Module):
+    """Streaming wrapper for unquantized bfloat16 switch expert projections.
+
+    Some model checkpoints store a small number of MoE layers as full bfloat16
+    rather than polar-quantized uint32. Without this wrapper all 128-expert
+    stacks for those layers accumulate as wired Metal allocations across the
+    forward pass, exhausting the device wired-memory limit.
+
+    This wrapper reads only the k router-selected expert slices from disk on
+    each forward call (via the safetensors reader) and releases them after the
+    computation — the same principle as StreamingSwitchLinear, but without the
+    polar-quantization kernel.
+    """
+
+    def __init__(self, weight_key: str, reader: SafetensorsExpertReader,
+                 output_dims: int, input_dims: int, num_experts: int):
+        super().__init__()
+        self._weight_key = weight_key
+        self._reader = reader
+        self.output_dims = output_dims
+        self.input_dims = input_dims
+        self.num_experts = num_experts
+        self.freeze()
+
+    def __call__(self, x, indices, sorted_indices=False):
+        # Sync routing indices to Python (one GPU->CPU round-trip per call).
+        flat = indices.reshape(-1)
+        mx.eval(flat)
+        flat_list = [int(v) for v in flat.tolist()]
+        unique = sorted(set(flat_list))
+
+        # Read only the selected experts from disk; wire only those slices.
+        # np_w is uint16 (same bytes as bfloat16); .view() reinterprets bits.
+        ws = []
+        for e in unique:
+            np_w, _ = self._reader.read_expert_np(self._weight_key, e)
+            ws.append(mx.array(np_w).view(mx.bfloat16))
+        w_stack = mx.stack(ws, axis=0)  # [n_sel, out, in]
+
+        # Remap global expert ids to local 0..n_sel-1 indices.
+        idx_map = {e: i for i, e in enumerate(unique)}
+        idx_local = mx.array(
+            [idx_map[e] for e in flat_list], dtype=mx.uint32,
+        ).reshape(indices.shape)
+
+        return mx.gather_mm(x, w_stack.swapaxes(-1, -2), rhs_indices=idx_local)
 
 _PROJS = ("gate_proj", "up_proj", "down_proj")
 
@@ -385,6 +434,42 @@ def load_streaming(model_path, cache_budget_gb: float = 3.0, fast: bool = False,
     pin_note = f", pinned {len(pin_keys)} hot expert-projections" if pin_keys else ""
     print(f"[stream] swapped {swapped} expert projections to streaming "
           f"(budget {cache_budget_gb:.1f} GB{pin_note})")
+
+    # Second pass: wrap unquantized bfloat16 switch_mlp projections.
+    # Some model checkpoints store a subset of MoE layers as full bfloat16
+    # rather than polar-quantized uint32 — the first pass (PolarQuantizedSwitchLinear
+    # check) skips them. Without streaming, their full [128, out, in] bfloat16
+    # stacks wire into Metal layer-by-layer and accumulate across the forward
+    # pass, exhausting the device wired-memory limit long before the last layer.
+    n_bf16 = 0
+    for i, layer in enumerate(layers):
+        sm = getattr(getattr(layer, 'mlp', None), 'switch_mlp', None)
+        if sm is None:
+            continue
+        for proj in _PROJS:
+            res = getattr(sm, proj, None)
+            if res is None:
+                continue
+            if isinstance(res, (StreamingSwitchLinear, _BF16StreamingSwitchLinear)):
+                continue  # already streaming
+            wkey = f"{prefix}.{i}.mlp.switch_mlp.{proj}.weight"
+            loc = reader._index.get(wkey)
+            if loc is None or loc.dtype != "BF16":
+                continue
+            n_exp, out_dims, in_dims = loc.shape
+            st = _BF16StreamingSwitchLinear(
+                weight_key=wkey,
+                reader=reader,
+                output_dims=out_dims,
+                input_dims=in_dims,
+                num_experts=n_exp,
+            )
+            setattr(sm, proj, st)
+            n_bf16 += 1
+    if n_bf16:
+        print(f"[stream] bfloat16 fallback: wrapped {n_bf16} unquantized expert "
+              f"projections as disk-backed streamers")
+
     _cap_active_experts(layers, max_active_experts)
 
     # Cross-session cache warmup: pre-load the hottest experts recorded by a
