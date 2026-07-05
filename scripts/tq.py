@@ -419,10 +419,26 @@ def run_generation(model_id: str, prompt: str, *, max_tokens: int, temp: float,
     for the duration of the run.
     """
     import mlx.core as mx
+    import mlx.core.metal as mx_metal
     import turboquant_mlx.compat  # noqa: F401  (registers mlx-lm compat shims)
     from mlx_lm.generate import stream_generate
     from mlx_lm.sample_utils import make_sampler
     from turboquant_mlx.stream.loader import load_streaming
+
+    # Cap Metal memory so the allocator fails fast rather than letting the OS
+    # kill the process or crashing with an opaque command-buffer OOM.
+    # Leave 4 GB for the OS + non-Metal allocations.
+    try:
+        phys_bytes = int(
+            __import__("subprocess").check_output(
+                ["sysctl", "-n", "hw.memsize"], stderr=__import__("subprocess").DEVNULL
+            ).strip()
+        )
+        limit = max(int(phys_bytes * 0.92), phys_bytes - 4 * 1024**3)
+        mx_metal.set_memory_limit(limit)
+        mx_metal.set_cache_memory_limit(int(phys_bytes * 0.05))
+    except Exception:
+        pass
 
     slug = slugify(model_id)
     wpath = warmup_path(slug)
@@ -624,12 +640,20 @@ def _step_warmup(model_id: str, slug: str, cache_budget_gb: float, k: int) -> No
     _ensure_dirs()
     # Runs against the ORIGINAL (non-freqsorted) model so logical ids in the
     # histogram match what the freq-sort step will reorder.
-    run_generation(
-        model_id, WARMUP_PROMPT, max_tokens=WARMUP_TOKENS, temp=0.0,
-        cache_budget_gb=cache_budget_gb, k=k, use_ane=False,
-        use_freqsort=False, chat_template=False, warmup_write=True, verbose=False,
-    )
-    _done("warmup histogram")
+    try:
+        run_generation(
+            model_id, WARMUP_PROMPT, max_tokens=WARMUP_TOKENS, temp=0.0,
+            cache_budget_gb=cache_budget_gb, k=k, use_ane=False,
+            use_freqsort=False, chat_template=False, warmup_write=True, verbose=False,
+        )
+        _done("warmup histogram")
+    except Exception as e:
+        msg = str(e)
+        if "Memory" in msg or "memory" in msg or "OutOfMemory" in msg:
+            print(f"\n  [!] warmup OOM — skipping histogram (freq-sort step will be skipped too)")
+            print(f"      Reduce --cache-budget-gb or close other apps and re-run setup to retry.")
+        else:
+            raise
 
 
 def _step_freqsort(slug: str) -> None:
