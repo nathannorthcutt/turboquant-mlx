@@ -475,6 +475,13 @@ def run_generation(model_id: str, prompt: str, *, max_tokens: int, temp: float,
     )
     load_sec = time.time() - t0
     print(f"[tq] loaded in {load_sec:.1f}s | resident RSS={_rss_gb():.2f} GB")
+    try:
+        metal_active = mx.metal.get_active_memory() / 1024**3
+        metal_peak   = mx.metal.get_peak_memory()   / 1024**3
+        metal_cache  = mx.metal.get_cache_memory()  / 1024**3
+        print(f"[tq] Metal memory — active={metal_active:.2f} GB  peak={metal_peak:.2f} GB  cache={metal_cache:.2f} GB")
+    except Exception:
+        pass
 
     text_prompt = prompt
     if chat_template and hasattr(tok, "apply_chat_template"):
