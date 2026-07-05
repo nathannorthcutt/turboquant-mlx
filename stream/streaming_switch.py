@@ -774,7 +774,8 @@ class StreamingSwitchLinear(nn.Module):
         # splits the output into gate / up halves, caches the up half for the
         # sibling up_proj, and returns the gate half. Saves a kernel launch and a
         # disk read pair per MoE layer per token.
-        if self._is_gate and getattr(cache.reader, 'has_fused_gate_up', False):
+        if (self._is_gate and getattr(cache.reader, 'has_fused_gate_up', False)
+                and self._layer_idx in cache.reader._fused_index):
             fwkey = self._weight_key.replace("gate_proj.weight", "gate_up_proj.weight")
             fskey = self._scales_key.replace("gate_proj.scales", "gate_up_proj.scales")
             w_sel, s_sel = cache.gather_fused(fwkey, fskey, self._layer_idx, sel)
