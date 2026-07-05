@@ -638,22 +638,32 @@ def _step_warmup(model_id: str, slug: str, cache_budget_gb: float, k: int) -> No
         return
     _start(f"warmup run ({WARMUP_TOKENS} tokens) to build routing histogram")
     _ensure_dirs()
-    # Runs against the ORIGINAL (non-freqsorted) model so logical ids in the
-    # histogram match what the freq-sort step will reorder.
-    try:
-        run_generation(
-            model_id, WARMUP_PROMPT, max_tokens=WARMUP_TOKENS, temp=0.0,
-            cache_budget_gb=cache_budget_gb, k=k, use_ane=False,
-            use_freqsort=False, chat_template=False, warmup_write=True, verbose=False,
-        )
+    # Run in a subprocess so a Metal OOM abort (C++ exception, uncatchable in Python)
+    # doesn't kill the setup process — Metal crashes call std::terminate() which
+    # bypasses Python exception handling entirely.
+    import subprocess as _sp
+    import sys as _sys
+    cmd = [
+        _sys.executable, "-c",
+        (
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "from scripts.tq import run_generation;"
+            "run_generation(sys.argv[2], sys.argv[3],"
+            " max_tokens=int(sys.argv[4]), temp=0.0,"
+            " cache_budget_gb=float(sys.argv[5]), k=int(sys.argv[6]),"
+            " use_ane=False, use_freqsort=False, chat_template=False,"
+            " warmup_write=True, verbose=True)"
+        ),
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        model_id, WARMUP_PROMPT,
+        str(WARMUP_TOKENS), str(cache_budget_gb), str(k),
+    ]
+    result = _sp.run(cmd, capture_output=False)
+    if result.returncode == 0 and os.path.isfile(wpath):
         _done("warmup histogram")
-    except Exception as e:
-        msg = str(e)
-        if "Memory" in msg or "memory" in msg or "OutOfMemory" in msg:
-            print(f"\n  [!] warmup OOM — skipping histogram (freq-sort step will be skipped too)")
-            print(f"      Reduce --cache-budget-gb or close other apps and re-run setup to retry.")
-        else:
-            raise
+    else:
+        print(f"\n  [!] warmup failed (exit {result.returncode}) — skipping histogram.")
+        print(f"      Inference will still work; re-run setup after closing other apps to retry.")
 
 
 def _step_freqsort(slug: str) -> None:
