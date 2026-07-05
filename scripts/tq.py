@@ -475,6 +475,20 @@ def run_generation(model_id: str, prompt: str, *, max_tokens: int, temp: float,
     )
     load_sec = time.time() - t0
     print(f"[tq] loaded in {load_sec:.1f}s | resident RSS={_rss_gb():.2f} GB")
+    # Force-evaluate all resident model parameters into Metal memory now, before
+    # inference, so we can measure the true wired footprint and detect OOM early
+    # with a useful message rather than a cryptic Metal command-buffer failure.
+    params = model.parameters()
+    flat_params = []
+    def _flatten(x):
+        if isinstance(x, mx.array):
+            flat_params.append(x)
+        elif isinstance(x, dict):
+            for v in x.values(): _flatten(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x: _flatten(v)
+    _flatten(params)
+    mx.eval(*flat_params)
     try:
         metal_active = mx.metal.get_active_memory() / 1024**3
         metal_peak   = mx.metal.get_peak_memory()   / 1024**3
