@@ -146,6 +146,11 @@ def _patch_moe_layer_barrier():
                     # One Metal command buffer per layer — prevents the full
                     # 94-layer graph from being submitted at once.
                     mx.eval(h)
+                    # Release freed Metal buffers back to the OS immediately.
+                    # Without this, MLX's buffer cache accumulates across 94
+                    # layers and pushes total wired memory past the wired limit
+                    # even though peak active data is small.
+                    mx.clear_cache()
 
                 return self.norm(h)
 
