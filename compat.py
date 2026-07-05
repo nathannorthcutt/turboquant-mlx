@@ -84,3 +84,76 @@ def _patch_nemotron_h_pattern():
 
 
 _patch_nemotron_h_pattern()
+
+
+def _patch_moe_layer_barrier():
+    """Force mx.eval(h) after every transformer layer in streamed MoE models.
+
+    Without this, MLX builds the entire N-layer computation graph lazily and
+    submits it as one Metal command buffer. For Qwen3-235B the prefill pass
+    touches nearly every expert across all 94 layers simultaneously — the
+    combined working set exceeds the Metal wired-memory limit and crashes.
+
+    Per-layer eval breaks the graph into 94 small command buffers. Each holds
+    one layer's expert stack (~1-2 GB) rather than the full ~36+ GB union.
+
+    Installed here rather than editing the mlx_lm source because mlx_lm may
+    resolve to the pip-installed site-packages copy, not the local checkout.
+    The patch is idempotent and targets the actual imported module.
+    """
+    import mlx.core as mx
+
+    _MOE_DECODER_STACKS = [
+        ("mlx_lm.models.qwen3_moe",   "Qwen3MoeModel"),
+        ("mlx_lm.models.qwen3_5_moe", "Qwen3_5MoeModel"),
+        ("mlx_lm.models.deepseek_v2", "DeepseekV2Model"),
+        ("mlx_lm.models.deepseek_v3", "DeepseekV3Model"),
+        ("mlx_lm.models.mixtral",     "MixtralModel"),
+    ]
+
+    for mod_path, cls_name in _MOE_DECODER_STACKS:
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        cls = getattr(mod, cls_name, None)
+        if cls is None or getattr(cls, "_tq_layer_barrier", False):
+            continue
+
+        orig_call = cls.__call__
+
+        def _make_patched(orig):
+            def _patched_call(self, inputs, cache=None, *args, **kwargs):
+                # Only patch the inner decoder stack (has both .layers and .norm).
+                # The outer lm-head Model wraps this and should pass through.
+                if not hasattr(self, "layers") or not hasattr(self, "norm"):
+                    return orig(self, inputs, cache=cache, *args, **kwargs)
+
+                from mlx_lm.models.base import create_attention_mask
+
+                h = (self.embed_tokens(inputs)
+                     if hasattr(self, "embed_tokens") and isinstance(inputs, mx.array)
+                     else inputs)
+
+                if cache is None:
+                    cache = [None] * len(self.layers)
+
+                mask = create_attention_mask(h, cache[0])
+
+                for layer, c in zip(self.layers, cache):
+                    h = layer(h, mask, c)
+                    # One Metal command buffer per layer — prevents the full
+                    # 94-layer graph from being submitted at once.
+                    mx.eval(h)
+
+                return self.norm(h)
+
+            _patched_call._tq_layer_barrier = True
+            return _patched_call
+
+        cls.__call__ = _make_patched(orig_call)
+        cls._tq_layer_barrier = True
+
+
+_patch_moe_layer_barrier()
