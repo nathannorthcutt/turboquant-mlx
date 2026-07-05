@@ -46,7 +46,22 @@ DEFAULT_MODEL = "manjunathshiva/Qwen3-235B-A22B-Instruct-2507-tq3a-tq2e-g32"
 # setup / run defaults (also documented in each subcommand's --help)
 DEF_MAX_TOKENS = 512
 DEF_TEMP = 0.7
-DEF_CACHE_BUDGET_GB = 20.0
+def _default_cache_budget_gb() -> float:
+    """Scale hot-tier budget to available RAM, leaving headroom for Metal compute."""
+    try:
+        import resource
+        # macOS: sysctl hw.memsize gives physical RAM bytes
+        import subprocess
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"],
+                                      stderr=subprocess.DEVNULL).strip()
+        ram_gb = int(out) / 1e9
+    except Exception:
+        return 12.0  # safe fallback
+    # Reserve ~60% for resident model parts + KV cache + Metal buffers; use rest for expert cache.
+    budget = ram_gb * 0.28
+    return round(max(8.0, min(budget, 24.0)), 1)
+
+DEF_CACHE_BUDGET_GB = _default_cache_budget_gb()
 DEF_K = 4
 
 WARMUP_PROMPT = "The key insight in transformer attention is"
