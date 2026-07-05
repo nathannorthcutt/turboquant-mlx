@@ -47,19 +47,26 @@ DEFAULT_MODEL = "manjunathshiva/Qwen3-235B-A22B-Instruct-2507-tq3a-tq2e-g32"
 DEF_MAX_TOKENS = 512
 DEF_TEMP = 0.7
 def _default_cache_budget_gb() -> float:
-    """Scale hot-tier budget to available RAM, leaving headroom for Metal compute."""
+    """Scale hot-tier budget against iogpu.wired_limit_mb (the actual Metal ceiling).
+
+    For Qwen3-235B the non-streaming resident weights (attention Q/K/V/O across
+    94 layers + embeddings) consume ~28 GB of wired Metal memory. The expert
+    streaming cache must fit in the remainder, leaving at least 6 GB for Metal
+    compute buffers, KV cache, and command-buffer overhead.
+    """
     try:
-        import resource
-        # macOS: sysctl hw.memsize gives physical RAM bytes
         import subprocess
-        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"],
-                                      stderr=subprocess.DEVNULL).strip()
-        ram_gb = int(out) / 1e9
+        wired_mb = int(subprocess.check_output(
+            ["sysctl", "-n", "iogpu.wired_limit_mb"], stderr=subprocess.DEVNULL
+        ).strip())
+        wired_gb = wired_mb / 1024
     except Exception:
-        return 12.0  # safe fallback
-    # Reserve ~60% for resident model parts + KV cache + Metal buffers; use rest for expert cache.
-    budget = ram_gb * 0.28
-    return round(max(8.0, min(budget, 24.0)), 1)
+        return 8.0  # safe fallback
+    # 28 GB resident estimate + 6 GB compute headroom; remainder is expert cache.
+    RESIDENT_ESTIMATE_GB = 28.0
+    COMPUTE_HEADROOM_GB  = 6.0
+    budget = wired_gb - RESIDENT_ESTIMATE_GB - COMPUTE_HEADROOM_GB
+    return round(max(4.0, min(budget, 20.0)), 1)
 
 DEF_CACHE_BUDGET_GB = _default_cache_budget_gb()
 DEF_K = 4
