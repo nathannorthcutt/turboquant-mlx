@@ -533,8 +533,10 @@ def _step_install() -> None:
             and importlib.util.find_spec("mlx_lm") is not None):
         _skip("dependencies installed")
         return
-    _start("installing dependencies (mlx-lm, turboquant-mlx)")
+    _start("installing dependencies (huggingface_hub, mlx-lm, turboquant-mlx)")
     root = repo_root()
+    # huggingface_hub >= 1.0 ships the `hf` CLI that replaced `huggingface-cli`.
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "huggingface_hub"])
     mlxlm = os.path.join(root, "mlx-lm")
     if os.path.isdir(mlxlm):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", mlxlm])
@@ -547,15 +549,20 @@ def _step_download(model_id: str, slug: str) -> None:
     if _model_shards(md):
         _skip(f"model downloaded ({md})")
         return
-    _start(f"downloading {model_id}")
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        print("[tq] huggingface_hub is required to download the model.\n"
-              "     Install it with:  pip install huggingface_hub", file=sys.stderr)
-        raise SystemExit(2)
+    _start(f"downloading {model_id} -> {md}")
     os.makedirs(md, exist_ok=True)
-    snapshot_download(repo_id=model_id, local_dir=md)
+    # Use the `hf` CLI (huggingface_hub >= 1.0). It picks up the token from
+    # `hf login` automatically and handles resumable downloads.
+    try:
+        subprocess.check_call(["hf", "download", model_id, "--local-dir", md])
+    except FileNotFoundError:
+        print(
+            "[tq] The `hf` CLI is required to download models.\n"
+            "     Install / upgrade with:  pip install -U huggingface_hub\n"
+            "     Then authenticate with:  hf login",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     _done(f"model downloaded ({md})")
 
 
