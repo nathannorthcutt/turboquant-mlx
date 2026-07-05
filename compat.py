@@ -132,6 +132,9 @@ def _patch_moe_layer_barrier():
 
                 from mlx_lm.models.base import create_attention_mask
 
+                import os
+                _diag = os.environ.get("TQ_MEM_DIAG", "0") == "1"
+
                 h = (self.embed_tokens(inputs)
                      if hasattr(self, "embed_tokens") and isinstance(inputs, mx.array)
                      else inputs)
@@ -141,7 +144,17 @@ def _patch_moe_layer_barrier():
 
                 mask = create_attention_mask(h, cache[0])
 
-                for layer, c in zip(self.layers, cache):
+                if _diag:
+                    mx.eval(h, mask)
+                    print(
+                        f"[tq-diag] barrier-loop active  layers={len(self.layers)}"
+                        f"  h={list(h.shape)}  mask={'None' if mask is None else list(mask.shape)}"
+                        f"  active={mx.get_active_memory()//1048576} MB"
+                        f"  peak={mx.get_peak_memory()//1048576} MB",
+                        flush=True,
+                    )
+
+                for i, (layer, c) in enumerate(zip(self.layers, cache)):
                     h = layer(h, mask, c)
                     # One Metal command buffer per layer — prevents the full
                     # 94-layer graph from being submitted at once.
@@ -150,7 +163,15 @@ def _patch_moe_layer_barrier():
                     # Without this, MLX's buffer cache accumulates across 94
                     # layers and pushes total wired memory past the wired limit
                     # even though peak active data is small.
-                    mx.clear_cache()
+                    if callable(getattr(mx, "clear_cache", None)):
+                        mx.clear_cache()
+                    if _diag:
+                        print(
+                            f"[tq-diag] layer {i:3d} ok"
+                            f"  active={mx.get_active_memory()//1048576:6d} MB"
+                            f"  peak={mx.get_peak_memory()//1048576:6d} MB",
+                            flush=True,
+                        )
 
                 return self.norm(h)
 
@@ -159,6 +180,20 @@ def _patch_moe_layer_barrier():
 
         cls.__call__ = _make_patched(orig_call)
         cls._tq_layer_barrier = True
+        print(f"[tq-compat] installed barrier+clear_cache on {mod_path}.{cls_name}", flush=True)
+
+
+def _check_mlx_version():
+    """Warn if mx.clear_cache is missing (MLX < 0.8)."""
+    import mlx.core as mx
+    if not callable(getattr(mx, "clear_cache", None)):
+        import warnings
+        warnings.warn(
+            "[tq-compat] mx.clear_cache() not available in this MLX version. "
+            "Per-layer buffer release is disabled. OOM risk is higher.",
+            stacklevel=2,
+        )
 
 
 _patch_moe_layer_barrier()
+_check_mlx_version()
