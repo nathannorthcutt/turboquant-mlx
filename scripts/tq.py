@@ -426,7 +426,6 @@ def run_generation(model_id: str, prompt: str, *, max_tokens: int, temp: float,
     for the duration of the run.
     """
     import mlx.core as mx
-    import mlx.core.metal as mx_metal
     import turboquant_mlx.compat  # noqa: F401  (registers mlx-lm compat shims)
     from mlx_lm.generate import stream_generate
     from mlx_lm.sample_utils import make_sampler
@@ -445,16 +444,12 @@ def run_generation(model_id: str, prompt: str, *, max_tokens: int, temp: float,
             _sp.check_output(["sysctl", "-n", "iogpu.wired_limit_mb"],
                              stderr=_sp.DEVNULL).strip()
         )
-        # Attention layers alone are ~28 GB; add expert cache + overhead.
-        # Warn when wired headroom is tight (< 90% of RAM).
-        recommended_mb = int(phys_gb * 0.92 * 1024)
-        if wired_mb < recommended_mb:
-            print(f"\n  [!] iogpu.wired_limit_mb={wired_mb} may be too low for this model.")
-            print(f"      Recommended: sudo sysctl iogpu.wired_limit_mb={recommended_mb}")
-            print(f"      To persist across reboots: add that line to /etc/sysctl.conf\n")
-        # Set MLX's own limit just below the wired cap so allocations fail fast.
-        mx.set_memory_limit(wired_mb * 1024 * 1024)
-        mx.set_cache_memory_limit(int(phys_bytes * 0.03))
+        # Expert weights are lazy (never wired unless explicitly eval'd).
+        # Only resident params + expert cache + compute buffers need to fit.
+        # Warn only when wired limit is genuinely low (< 20 GB).
+        if wired_mb > 0 and wired_mb < 20 * 1024:
+            print(f"\n  [!] iogpu.wired_limit_mb={wired_mb} is unusually low.")
+            print(f"      Recommended minimum: sudo sysctl iogpu.wired_limit_mb=20480\n")
     except Exception:
         pass
 
