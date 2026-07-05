@@ -56,11 +56,16 @@ class _BF16StreamingSwitchLinear(nn.Module):
         unique = sorted(set(flat_list))
 
         # Read only the selected experts from disk; wire only those slices.
-        # np_w is uint16 (same bytes as bfloat16); .view() reinterprets bits.
+        # BF16 is stored as uint16 in numpy — use .view() to reinterpret the
+        # bits as bfloat16 rather than converting the values. F16 and others
+        # are stored as their native numpy dtype and can be passed directly.
         ws = []
         for e in unique:
-            np_w, _ = self._reader.read_expert_np(self._weight_key, e)
-            ws.append(mx.array(np_w).view(mx.bfloat16))
+            np_w, mlx_dt = self._reader.read_expert_np(self._weight_key, e)
+            if mlx_dt == mx.bfloat16:
+                ws.append(mx.array(np_w).view(mx.bfloat16))
+            else:
+                ws.append(mx.array(np_w, dtype=mlx_dt))
         w_stack = mx.stack(ws, axis=0)  # [n_sel, out, in]
 
         # Remap global expert ids to local 0..n_sel-1 indices.
@@ -435,13 +440,17 @@ def load_streaming(model_path, cache_budget_gb: float = 3.0, fast: bool = False,
     print(f"[stream] swapped {swapped} expert projections to streaming "
           f"(budget {cache_budget_gb:.1f} GB{pin_note})")
 
-    # Second pass: wrap unquantized bfloat16 switch_mlp projections.
-    # Some model checkpoints store a subset of MoE layers as full bfloat16
-    # rather than polar-quantized uint32 — the first pass (PolarQuantizedSwitchLinear
-    # check) skips them. Without streaming, their full [128, out, in] bfloat16
-    # stacks wire into Metal layer-by-layer and accumulate across the forward
-    # pass, exhausting the device wired-memory limit long before the last layer.
-    n_bf16 = 0
+    # Second pass: wrap any remaining large floating-point switch_mlp projections.
+    # Some model checkpoints store a subset of MoE layers as full-precision
+    # (bfloat16 or float16) rather than polar-quantized uint32. The first pass
+    # skips them (not PolarQuantizedSwitchLinear). Without streaming, those
+    # [128, out, in] stacks wire into Metal as each layer executes and accumulate
+    # across the forward pass, exhausting the wired-memory limit.
+    #
+    # Detection: inspect the model weight directly (ndim==3, shape[0] matches
+    # num_experts) rather than trusting the reader dtype string, which can vary
+    # (BF16 vs F16) across checkpoints and wasn't reliable in practice.
+    n_fp = 0
     for i, layer in enumerate(layers):
         sm = getattr(getattr(layer, 'mlp', None), 'switch_mlp', None)
         if sm is None:
@@ -452,9 +461,21 @@ def load_streaming(model_path, cache_budget_gb: float = 3.0, fast: bool = False,
                 continue
             if isinstance(res, (StreamingSwitchLinear, _BF16StreamingSwitchLinear)):
                 continue  # already streaming
+            w = getattr(res, 'weight', None)
+            if not isinstance(w, mx.array) or w.ndim != 3 or w.shape[0] < 8:
+                continue
+            # Large unstreamed stacked expert weight. Verify the reader has the
+            # disk key so read_expert_np won't KeyError at inference time.
             wkey = f"{prefix}.{i}.mlp.switch_mlp.{proj}.weight"
             loc = reader._index.get(wkey)
-            if loc is None or loc.dtype != "BF16":
+            if loc is None:
+                print(f"[stream] WARNING: unstreamed expert weight {wkey!r} not in "
+                      f"reader index — will wire {w.nbytes >> 20} MB at inference "
+                      f"(OOM risk at layer {i})")
+                continue
+            if loc.dtype not in ("BF16", "F16", "F32"):
+                print(f"[stream] WARNING: unstreamed expert weight {wkey!r} has "
+                      f"unexpected dtype {loc.dtype!r}; skipping streaming wrap")
                 continue
             n_exp, out_dims, in_dims = loc.shape
             st = _BF16StreamingSwitchLinear(
@@ -465,9 +486,9 @@ def load_streaming(model_path, cache_budget_gb: float = 3.0, fast: bool = False,
                 num_experts=n_exp,
             )
             setattr(sm, proj, st)
-            n_bf16 += 1
-    if n_bf16:
-        print(f"[stream] bfloat16 fallback: wrapped {n_bf16} unquantized expert "
+            n_fp += 1
+    if n_fp:
+        print(f"[stream] full-precision fallback: wrapped {n_fp} unquantized expert "
               f"projections as disk-backed streamers")
 
     _cap_active_experts(layers, max_active_experts)
