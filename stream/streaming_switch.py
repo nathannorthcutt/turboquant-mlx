@@ -748,7 +748,6 @@ class StreamingSwitchLinear(nn.Module):
                 mx.array([True], dtype=mx.bool_),
                 sorted_flat[1:] != sorted_flat[:-1],
             ])
-            sel_mx = sorted_flat[changed]          # unique sorted expert ids
 
             # Rank of each sorted position within the unique set (0-based).
             ranks_in_sorted = mx.cumsum(changed.astype(mx.uint32)) - 1  # (K,)
@@ -757,10 +756,12 @@ class StreamingSwitchLinear(nn.Module):
             inv_sort = mx.argsort(sort_order)
             idx_local_flat = ranks_in_sorted[inv_sort]  # remap for original order
 
-            # Materialise sel as a Python list — K≤4 integers, negligible cost.
-            # Required by cache.gather / on_layer_start (Python dict keys).
-            mx.eval(sel_mx)
-            sel = [int(v) for v in sel_mx.tolist()]
+            # Materialise: MLX doesn't support boolean fancy indexing, so extract
+            # unique expert ids in Python after eval.
+            mx.eval(sorted_flat, changed)
+            sf = sorted_flat.tolist()
+            ch = changed.tolist()
+            sel = [sf[i] for i in range(len(ch)) if ch[i]]
             # Only the trigger caches its routing and fires the next-layer
             # speculative prefetch / calibration trace (once per token).
             if self._is_trigger:
