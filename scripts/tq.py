@@ -682,9 +682,12 @@ def _step_freqsort(slug: str) -> None:
     if _model_shards(fq) and os.path.isfile(os.path.join(fq, "perm.json")):
         _skip("freq-sort repack (model_freqsorted/)")
         return
+    wpath = warmup_path(slug)
+    if not os.path.isfile(wpath):
+        _skip("freq-sort repack (no histogram yet — re-run setup once warmup succeeds)")
+        return
     _start("freq-sort repack (hot experts -> low file offsets)")
     md = model_dir(slug)
-    wpath = warmup_path(slug)
     import shutil
     from turboquant_mlx.stream import repack as rp
 
