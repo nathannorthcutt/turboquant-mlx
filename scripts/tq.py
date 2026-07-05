@@ -425,18 +425,29 @@ def run_generation(model_id: str, prompt: str, *, max_tokens: int, temp: float,
     from mlx_lm.sample_utils import make_sampler
     from turboquant_mlx.stream.loader import load_streaming
 
-    # Cap Metal memory so the allocator fails fast rather than letting the OS
-    # kill the process or crashing with an opaque command-buffer OOM.
-    # Leave 4 GB for the OS + non-Metal allocations.
+    # Check iogpu.wired_limit_mb — on Apple Silicon this caps how much memory
+    # Metal can wire for GPU use (default ~75% of RAM). Large models need it raised.
     try:
+        import subprocess as _sp
         phys_bytes = int(
-            __import__("subprocess").check_output(
-                ["sysctl", "-n", "hw.memsize"], stderr=__import__("subprocess").DEVNULL
-            ).strip()
+            _sp.check_output(["sysctl", "-n", "hw.memsize"],
+                             stderr=_sp.DEVNULL).strip()
         )
-        limit = max(int(phys_bytes * 0.92), phys_bytes - 4 * 1024**3)
-        mx_metal.set_memory_limit(limit)
-        mx_metal.set_cache_memory_limit(int(phys_bytes * 0.05))
+        phys_gb = phys_bytes / 1024**3
+        wired_mb = int(
+            _sp.check_output(["sysctl", "-n", "iogpu.wired_limit_mb"],
+                             stderr=_sp.DEVNULL).strip()
+        )
+        # Attention layers alone are ~28 GB; add expert cache + overhead.
+        # Warn when wired headroom is tight (< 90% of RAM).
+        recommended_mb = int(phys_gb * 0.92 * 1024)
+        if wired_mb < recommended_mb:
+            print(f"\n  [!] iogpu.wired_limit_mb={wired_mb} may be too low for this model.")
+            print(f"      Recommended: sudo sysctl iogpu.wired_limit_mb={recommended_mb}")
+            print(f"      To persist across reboots: add that line to /etc/sysctl.conf\n")
+        # Set MLX's own limit just below the wired cap so allocations fail fast.
+        mx.set_memory_limit(wired_mb * 1024 * 1024)
+        mx.set_cache_memory_limit(int(phys_bytes * 0.03))
     except Exception:
         pass
 
