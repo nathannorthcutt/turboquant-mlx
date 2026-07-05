@@ -475,27 +475,6 @@ def run_generation(model_id: str, prompt: str, *, max_tokens: int, temp: float,
     )
     load_sec = time.time() - t0
     print(f"[tq] loaded in {load_sec:.1f}s | resident RSS={_rss_gb():.2f} GB")
-    # Force-evaluate all resident model parameters into Metal memory now, before
-    # inference, so we can measure the true wired footprint and detect OOM early
-    # with a useful message rather than a cryptic Metal command-buffer failure.
-    params = model.parameters()
-    flat_params = []
-    def _flatten(x):
-        if isinstance(x, mx.array):
-            flat_params.append(x)
-        elif isinstance(x, dict):
-            for v in x.values(): _flatten(v)
-        elif isinstance(x, (list, tuple)):
-            for v in x: _flatten(v)
-    _flatten(params)
-    mx.eval(*flat_params)
-    try:
-        metal_active = mx.metal.get_active_memory() / 1024**3
-        metal_peak   = mx.metal.get_peak_memory()   / 1024**3
-        metal_cache  = mx.metal.get_cache_memory()  / 1024**3
-        print(f"[tq] Metal memory — active={metal_active:.2f} GB  peak={metal_peak:.2f} GB  cache={metal_cache:.2f} GB")
-    except Exception:
-        pass
 
     text_prompt = prompt
     if chat_template and hasattr(tok, "apply_chat_template"):
@@ -512,10 +491,21 @@ def run_generation(model_id: str, prompt: str, *, max_tokens: int, temp: float,
     prompt_tokens = 0
     gen_tokens = 0
     t_start = time.perf_counter()
+    _metal_printed = False
     for i, resp in enumerate(stream_generate(
             model, tok, text_prompt, max_tokens=max_tokens, sampler=sampler)):
         if ttft is None:
             ttft = time.perf_counter() - t_start
+        # Print Metal memory after first token — only params actually needed by
+        # the forward pass have been wired by now (lazy expert arrays stay cold).
+        if not _metal_printed:
+            _metal_printed = True
+            try:
+                ma = mx.get_active_memory() / 1024**3
+                mp = mx.get_peak_memory()   / 1024**3
+                print(f"[tq] Metal after token 1 — active={ma:.2f} GB  peak={mp:.2f} GB")
+            except Exception:
+                pass
         text += resp.text
         prompt_tokens = resp.prompt_tokens
         gen_tokens = resp.generation_tokens
